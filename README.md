@@ -10,7 +10,10 @@ every game env one way to say who they are:
 - **Two task steps**, `add_player_slot` and `start_match`, that fill and close the lobby of any game env built on it.
 
 The same task steps then seat players in any game: one agent against the game's AI, two models against each other, a
-person beside an agent.
+person beside an agent. Warcraft III's env, in
+[agentenv-wc3-plugin](https://github.com/earakely-scale/agentenv-wc3-plugin), is built on it. Its lobby takes a
+match's settings (map, seed, time limit, clock), and its slots take a race, a team, a label and, for the game's AI, a
+level.
 
 ```
 deploy_env ── your game's own step (opens the lobby with the game's settings)
