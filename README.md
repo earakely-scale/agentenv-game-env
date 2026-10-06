@@ -7,7 +7,8 @@ every game env one way to say who they are:
   occupant at a time before the game is created. An occupant is an agent, a person, or the game's own AI.
 - **`AgentEnvGameEnv`**, the base class that serves the lobby and tells each request which slot it plays. A game marks
   its own parts of the lobby with decorators.
-- **Two task steps**, `add_player_slot` and `start_match`, that fill and close the lobby of any game env built on it.
+- **Three task steps**, `create_match`, `add_player_slot` and `start_match`, that open, fill and close the lobby of
+  any game env built on it.
 
 The same task steps then seat players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent. Warcraft III's env, in
@@ -16,7 +17,7 @@ match's settings (map, seed, time limit, clock), and its slots take a race, a te
 level.
 
 ```
-deploy_env ── your game's own step (opens the lobby with the game's settings)
+deploy_env ── create_match (opens the lobby with the game's settings)
                  ├─ add_player_slot {ai, faction: "orc", team: 2}
                  ├─ deploy_agent p1 ── add_player_slot {agent: "p1", faction: "human", team: 1} ──┐
                  └─ deploy_agent p2 ── add_player_slot {agent: "p2", faction: "undead", team: 1} ─┤
@@ -129,9 +130,11 @@ agent against the game's AI:
 [
   {"id": "deploy", "type": "deploy_env", "env_id": "tictactoe"},
   {"id": "agent", "type": "deploy_agent", "agent_name": "alice", "a2a_agent_id": "your-agent", "env_ids": []},
-  {"id": "seat-alice", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["deploy", "agent"],
+  {"id": "match", "type": "create_match", "env_id": "tictactoe", "additional_settings": {"first": "o"},
+   "depends_on": ["deploy"]},
+  {"id": "seat-alice", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match", "agent"],
    "occupant": {"kind": "agent", "name": "alice"}, "additional_settings": {"faction": "x"}},
-  {"id": "seat-ai", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["deploy"],
+  {"id": "seat-ai", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match"],
    "occupant": {"kind": "ai"}, "additional_settings": {"faction": "o"}},
   {"id": "start", "type": "start_match", "env_id": "tictactoe", "depends_on": ["seat-alice", "seat-ai"]},
   {"id": "play", "type": "prompt_agent", "agent_name": "alice", "depends_on": ["start"],
@@ -254,6 +257,22 @@ the player routing (the SDK serves one handler per extension, so the lobby's oth
 
 ## The task steps
 
+**`create_match`** opens the lobby for a match:
+
+| Field | |
+|---|---|
+| `env_id` | the game env |
+| `additional_settings` | the game's own settings for the match (tic-tac-toe: `first`; Warcraft III: `map`, `seed`, `time_limit_seconds`, `mode`, ...) |
+| `player_slot_settings` | optional: `{"min": n, "max": n}` to narrow the game's own limits |
+| `timeout_seconds` | default `120` |
+
+- **Defaults and checks come from the env.** Settings left out get the game's defaults, and a setting the game
+  doesn't take is refused (`bad_settings`) before any game exists.
+- **A run can override it,** through agent-env's per-run step overrides (`user_overrides.step_params.<step id>`). An
+  overridden `additional_settings` merges key by key into the task's (`{"additional_settings": {"seed": 7}}` changes
+  only the seed), and `player_slot_settings` replaces the task's.
+- **The opened lobby is kept** in the run's `metadata["game_lobby"]`.
+
 **`add_player_slot`** fills one slot:
 
 | Field | |
@@ -294,7 +313,6 @@ uv venv && uv pip install -e ".[dev]"
   opens a new lobby.
 - **A slot's address isn't a secret.** Any client that can reach the env can use another player's path or header. A
   per-slot token in `connect.headers` would close that.
-- **No generic step opens the lobby.** Each game's own step does it, with its typed settings.
 
 ## License
 

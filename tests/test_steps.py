@@ -6,7 +6,7 @@ from agent_env.task_step.registry import get_task_step_registry
 from conftest import FakeAgent, deployed, serving
 from tictactoe import TicTacToe
 
-from agentenv_game.steps import AddPlayerSlotTaskStep, StartMatchTaskStep
+from agentenv_game.steps import AddPlayerSlotTaskStep, CreateMatchTaskStep, StartMatchTaskStep
 
 pytestmark = pytest.mark.anyio
 
@@ -52,6 +52,25 @@ async def test_a_slot_kept_for_a_player_that_connects_on_its_own_and_a_refusal()
             await add("again", {"kind": "agent", "name": "carol"}, "o", register=False).execute(context)
 
 
+async def test_create_match_opens_the_lobby_with_the_games_settings_and_a_runs_overrides():
+    game = TicTacToe()
+    async with deployed(game) as env:
+        context = TaskStepContext(deployed_envs=[env])
+        step = CreateMatchTaskStep(id="match", version=None, env_id="tictactoe", additional_settings={"first": "x"})
+        await step.execute(context)
+        assert context.metadata["game_lobby"]["additional_settings"] == {"first": "x"} and game.lobby_opened
+        context.metadata["user_overrides"] = {"step_params": {"match": {"additional_settings": {"first": "o"}}}}
+        await step.execute(context)
+        assert game.lobby.additional_settings == {"first": "o"} and game.lobby.slots == []
+        refused = CreateMatchTaskStep(id="match", version=None, env_id="tictactoe",
+                                      additional_settings={"first": "z"})
+        with pytest.raises(RuntimeError, match="lobby open: bad_settings: .*who moves first"):
+            await refused.execute(TaskStepContext(deployed_envs=[env]))
+        with pytest.raises(RuntimeError, match="bad_settings: tic-tac-toe has two players"):
+            await CreateMatchTaskStep(id="m", version=None, env_id="tictactoe",
+                                      player_slot_settings={"max": 3}).execute(TaskStepContext(deployed_envs=[env]))
+
+
 def test_the_steps_load_from_task_json():
     registry = get_task_step_registry()
     data = {"id": "seat", "type": "add_player_slot", "env_id": "tictactoe", "occupant": {"kind": "ai"},
@@ -59,5 +78,10 @@ def test_the_steps_load_from_task_json():
     step = registry["add_player_slot"].from_dict(data)
     assert step.to_dict()["occupant"] == {"kind": "ai"} and step.to_dict()["additional_settings"] == {"faction": "o"}
     assert registry["start_match"].from_dict({"id": "start", "type": "start_match", "env_id": "tictactoe"})
+    match = registry["create_match"].from_dict({"id": "match", "type": "create_match", "env_id": "tictactoe",
+                                                "additional_settings": {"first": "o"}})
+    assert match.to_dict()["additional_settings"] == {"first": "o"} and match.to_dict()["player_slot_settings"] is None
+    with pytest.raises(ValueError, match=r"min \(3\) is more than max \(2\)"):
+        CreateMatchTaskStep(id="m", version=None, env_id="tictactoe", player_slot_settings={"min": 3, "max": 2})
     with pytest.raises(ValueError, match="agent occupants need a name"):
         registry["add_player_slot"].from_dict({**data, "occupant": {"kind": "agent"}})

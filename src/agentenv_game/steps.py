@@ -1,5 +1,6 @@
-"""The lobby's task steps: `add_player_slot` fills one slot of a deployed game env's lobby and gives an agent its
-slot's address; `start_match` closes the lobby, which creates the game."""
+"""The lobby's task steps: `create_match` opens a deployed game env's lobby with the game's settings,
+`add_player_slot` fills one slot and gives an agent its slot's address, and `start_match` closes the lobby, which
+creates the game."""
 
 from __future__ import annotations
 
@@ -19,9 +20,57 @@ from agentenv_protocol import client
 from agentenv_protocol.types import MCP_PATH
 from pydantic import ValidationError
 
-from .lobby import LOBBY, Connect, Occupant, OccupantKind, PlayerSlot
+from .lobby import LOBBY, Connect, Occupant, OccupantKind, PlayerSlot, PlayerSlotSettings
 
 log = logging.getLogger(__name__)
+
+
+class CreateMatchTaskStep(TaskStep):
+    """Open a deployed game env's lobby for a match: `additional_settings` are the game's own (WC3: map, seed,
+    time_limit_seconds, mode), `player_slot_settings` optionally narrow its slots ({min, max}). The env fills in its
+    defaults and refuses what it doesn't take. A run's step overrides merge into `additional_settings` and replace
+    `player_slot_settings`. The opened lobby is kept in the run's `metadata["game_lobby"]`."""
+
+    type: ClassVar[str] = "create_match"
+    entity_refs = (EntityRef.env("env_id"),)
+
+    def __init__(self, id: str, version: int | None, env_id: str, additional_settings: dict | None = None,
+                 player_slot_settings: dict | None = None, timeout_seconds: int = 120, depends_on: list | None = None,
+                 fail_task_on_error: bool = True):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        if additional_settings is not None and not isinstance(additional_settings, dict):
+            raise ValueError("create_match additional_settings is an object")
+        try:
+            if player_slot_settings is not None:
+                PlayerSlotSettings(**player_slot_settings)
+        except (TypeError, ValidationError) as e:
+            raise ValueError(f"create_match player_slot_settings: {e}") from e
+        self.env_id, self.timeout_seconds = env_id, timeout_seconds
+        self.additional_settings = dict(additional_settings or {})
+        self.player_slot_settings = dict(player_slot_settings) if player_slot_settings is not None else None
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "env_id": self.env_id, "additional_settings": self.additional_settings,
+                "player_slot_settings": self.player_slot_settings, "timeout_seconds": self.timeout_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CreateMatchTaskStep:
+        return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", True)},
+                   env_id=data["env_id"], **{k: data[k] for k in ("additional_settings", "player_slot_settings",
+                                                                  "timeout_seconds") if k in data})
+
+    async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        deployed = _deployed(context, self.env_id)
+        overrides = self.step_param_overrides(context)
+        request = {"additional_settings": {**self.additional_settings, **(overrides.get("additional_settings") or {})},
+                   "player_slot_settings": overrides.get("player_slot_settings", self.player_slot_settings)}
+        lobby = await _invoke(deployed, "open", {k: v for k, v in request.items() if v is not None},
+                              self.timeout_seconds)
+        context.metadata["game_lobby"] = lobby
+        limits = lobby.get("player_slot_settings") or {}
+        log.info("create_match: %s opened a lobby for %s to %s players with %s", self.env_id, limits.get("min", 0),
+                 limits.get("max", "any number of"), lobby.get("additional_settings"))
+        return context
 
 
 class AddPlayerSlotTaskStep(TaskStep):

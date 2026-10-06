@@ -31,6 +31,7 @@ dev = ["pytest>=8,<10", "pytest-timeout>=2", "anyio>=4", "uvicorn>=0.30", "ruff>
 Source = "https://github.com/earakely-scale/agentenv-game-env"
 
 [project.entry-points."agent_env.task_steps"]
+create_match = "agentenv_game.steps:CreateMatchTaskStep"
 add_player_slot = "agentenv_game.steps:AddPlayerSlotTaskStep"
 start_match = "agentenv_game.steps:StartMatchTaskStep"
 
