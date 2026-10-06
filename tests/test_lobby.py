@@ -38,7 +38,9 @@ def refused(code, call, *args):
 
 
 def test_a_new_env_has_an_open_lobby_with_the_games_defaults():
-    lobby = TicTacToe().lobby
+    game = TicTacToe()
+    lobby = game.lobby
+    assert not game.lobby_opened
     assert lobby.state is LobbyState.OPEN and lobby.additional_settings == {"first": "x"} and lobby.slots == []
     assert (lobby.player_slot_settings.min, lobby.player_slot_settings.max) == (2, 2)
     assert lobby.player_slot_settings.additional_settings == {"occupants": ["agent", "ai"], "factions": ["x", "o"]}
@@ -92,7 +94,7 @@ async def test_a_lobby_closes_only_with_enough_players_and_a_new_one_drops_the_g
     game.fill_slot(ai("o"))
     await game.close_lobby()
     lobby = game.new_lobby({"first": "o"})
-    assert lobby.state is LobbyState.OPEN and lobby.slots == [] and game.lobby is lobby
+    assert lobby.state is LobbyState.OPEN and lobby.slots == [] and game.lobby is lobby and game.lobby_opened
 
 
 async def _refused_async(code, call):

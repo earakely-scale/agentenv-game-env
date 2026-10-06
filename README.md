@@ -156,7 +156,8 @@ agent against the game's AI:
 - **`close`** creates the game from the filled slots. After that the lobby is read-only, and the game is the env's
   business (turns, start gates, results).
 
-An env whose lobby was never opened has an open one with the game's default settings.
+An env whose lobby was never opened has an open one with the game's default settings, and `lobby_opened` is false
+until a lobby is opened. A game can use that to offer its own default game to a client that never opens one.
 
 ### Methods
 

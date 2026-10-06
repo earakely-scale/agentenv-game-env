@@ -91,6 +91,8 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
     that header."""
 
     player_header: str | None = None
+    lobby_opened = False
+    """False until a lobby is opened: until then the env has the default one, with the game's default settings."""
     _lobby: Lobby | None = None
     _game: dict | None = None
     _closing: asyncio.Lock | None = None
@@ -140,6 +142,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
                   player_slot_settings: PlayerSlotSettings | None = None) -> Lobby:
         """Open a new lobby, dropping the last one and its game."""
         self._lobby, self._game = self._opened(additional_settings or {}, player_slot_settings), None
+        self.lobby_opened = True
         return self._lobby
 
     def fill_slot(self, request: SlotRequest) -> PlayerSlot:
