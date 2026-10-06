@@ -1,9 +1,10 @@
-"""The lobby's task steps: `create_match` opens a deployed game env's lobby with the game's settings,
-`add_player_slot` fills one slot and gives an agent its slot's address, and `start_match` closes the lobby, which
-creates the game."""
+"""A game env's task steps: `add_license` gives the game the license it lacks, from agent-env's secret store;
+`create_match` opens its lobby with the game's settings, `add_player_slot` fills one slot and gives an agent its slot's
+address, and `start_match` closes the lobby, which creates the game."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from functools import partial
@@ -11,6 +12,7 @@ from typing import ClassVar
 
 import httpx
 from agent_env.a2a_agent.a2a_agent import A2AAgent
+from agent_env.config import get_config
 from agent_env.entity_refs import EntityRef
 from agent_env.env.env import DeployedEnv, DeployedSandboxEnv
 from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url, sandbox_request_headers_for_url
@@ -20,9 +22,72 @@ from agentenv_protocol import client
 from agentenv_protocol.types import MCP_PATH
 from pydantic import ValidationError
 
+from .license import LICENSE, LicenseItem, LicenseKind
 from .lobby import LOBBY, Connect, Occupant, OccupantKind, PlayerSlot, PlayerSlotSettings
 
 log = logging.getLogger(__name__)
+
+
+class AddLicenseTaskStep(TaskStep):
+    """Give a deployed game env the license it lacks (`urn:game:license/v1`), from agent-env's secret store. `files`
+    and `keys` map each part's name to the secret holding it: a file's secret holds its base64, a key's the key
+    itself. `accept` lists the terms the task agrees to. The step asks the env what it lacks first, then reads only
+    those secrets, and none when it lacks nothing. A lobby doesn't close while its game lacks its license, so put this
+    before start_match. The parts' names go in the run's `metadata["game_license"]`; their contents go nowhere else."""
+
+    type: ClassVar[str] = "add_license"
+    entity_refs = (EntityRef.env("env_id"),)
+
+    def __init__(self, id: str, version: int | None, env_id: str, files: dict | None = None,
+                 keys: dict | None = None, accept: list | None = None, timeout_seconds: int = 60,
+                 depends_on: list | None = None, fail_task_on_error: bool = True):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        for field, mapping in (("files", files), ("keys", keys)):
+            if mapping is not None and not (isinstance(mapping, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) and v for k, v in mapping.items())):
+                raise ValueError(f"add_license {field} maps each part's name to the name of the secret holding it")
+        if accept is not None and not (isinstance(accept, list) and all(isinstance(a, str) and a for a in accept)):
+            raise ValueError("add_license accept is a list of the terms' names")
+        self.env_id, self.timeout_seconds = env_id, timeout_seconds
+        self.files, self.keys, self.accept = dict(files or {}), dict(keys or {}), list(accept or [])
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "env_id": self.env_id, "files": self.files, "keys": self.keys,
+                "accept": self.accept, "timeout_seconds": self.timeout_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> AddLicenseTaskStep:
+        return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", True)},
+                   env_id=data["env_id"],
+                   **{k: data[k] for k in ("files", "keys", "accept", "timeout_seconds") if k in data})
+
+    async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        deployed = _deployed(context, self.env_id)
+        status = await _invoke(deployed, LICENSE, "get", {}, self.timeout_seconds)
+        missing = [LicenseItem(**i) for i in status["missing"]]
+        sources = {LicenseKind.FILE: self.files, LicenseKind.KEY: self.keys}
+        if unmapped := [i for i in missing if (i.name not in self.accept if i.kind is LicenseKind.ACCEPTANCE
+                                               else i.name not in sources[i.kind])]:
+            raise RuntimeError(f"env {self.env_id!r} lacks {', '.join(i.label() for i in unmapped)}: map each file "
+                               "or key to the secret holding it (files, keys), and list terms you accept (accept)")
+        given: dict = {"files": {}, "keys": {}, "accept": [i.name for i in missing
+                                                         if i.kind is LicenseKind.ACCEPTANCE]}
+        store = get_config().get_secret_store()
+        for item in (i for i in missing if i.kind is not LicenseKind.ACCEPTANCE):
+            secret = sources[item.kind][item.name]
+            value = await asyncio.to_thread(store.get, secret)
+            if not value:
+                raise RuntimeError(f"agent-env's secret store has no {secret!r} ({item.label()})")
+            given["files" if item.kind is LicenseKind.FILE else "keys"][item.name] = value
+        if missing:
+            status = await _invoke(deployed, LICENSE, "add", given, self.timeout_seconds)
+            if status["missing"]:
+                raise RuntimeError(f"env {self.env_id!r} still lacks "
+                                   f"{', '.join(LicenseItem(**i).label() for i in status['missing'])}")
+        context.metadata["game_license"] = {"installed": status["installed"]}
+        log.info("add_license: %s has its license (%s)", self.env_id,
+                 ", ".join(i.name for i in missing) + " given" if missing else "it lacked nothing")
+        return context
 
 
 class CreateMatchTaskStep(TaskStep):
@@ -64,7 +129,7 @@ class CreateMatchTaskStep(TaskStep):
         overrides = self.step_param_overrides(context)
         request = {"additional_settings": {**self.additional_settings, **(overrides.get("additional_settings") or {})},
                    "player_slot_settings": overrides.get("player_slot_settings", self.player_slot_settings)}
-        lobby = await _invoke(deployed, "open", {k: v for k, v in request.items() if v is not None},
+        lobby = await _invoke(deployed, LOBBY, "open", {k: v for k, v in request.items() if v is not None},
                               self.timeout_seconds)
         context.metadata["game_lobby"] = lobby
         limits = lobby.get("player_slot_settings") or {}
@@ -117,7 +182,7 @@ class AddPlayerSlotTaskStep(TaskStep):
         request = {"occupant": self.occupant.model_dump(mode="json", exclude_none=True),
                    "additional_settings": self.additional_settings,
                    **({"slot": self.slot} if self.slot is not None else {})}
-        slot = PlayerSlot(**await _invoke(deployed, "fill", request, self.timeout_seconds))
+        slot = PlayerSlot(**await _invoke(deployed, LOBBY, "fill", request, self.timeout_seconds))
         name = slot.occupant.name
         record = slot.model_dump(mode="json", exclude_none=True)
         base = deployed.mcp_url.removesuffix(MCP_PATH)
@@ -158,7 +223,7 @@ class StartMatchTaskStep(TaskStep):
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         deployed = _deployed(context, self.env_id)
-        result = await _invoke(deployed, "close", {}, self.timeout_seconds)
+        result = await _invoke(deployed, LOBBY, "close", {}, self.timeout_seconds)
         context.metadata["game_lobby"] = result
         log.info("start_match: %s created its game with %d players", self.env_id, len(result.get("slots") or ()))
         return context
@@ -201,13 +266,14 @@ def _agent(context: TaskStepContext, name: str) -> DeployedAgent:
     return agent
 
 
-async def _invoke(deployed: DeployedEnv, method: str, params: dict, timeout: int) -> dict:
-    card = _card(deployed)
+async def _invoke(deployed: DeployedEnv, uri: str, method: str, params: dict, timeout: int) -> dict:
+    card = _card(deployed, uri)
+    what = "license" if uri == LICENSE else "lobby"
     try:
-        return await client.invoke_extension(deployed.environment_url, card, LOBBY, params, timeout=timeout,
+        return await client.invoke_extension(deployed.environment_url, card, uri, params, timeout=timeout,
                                              method=method)
     except httpx.HTTPStatusError as e:
-        raise RuntimeError(f"env {deployed.env_id!r} lobby {method}: {_message(e.response.text)}") from e
+        raise RuntimeError(f"env {deployed.env_id!r} {what} {method}: {_message(e.response.text)}") from e
 
 
 def _message(body: str) -> str:
@@ -226,10 +292,10 @@ def _deployed(context: TaskStepContext, env_id: str) -> DeployedEnv:
     return deployed
 
 
-def _card(deployed: DeployedEnv) -> dict:
-    """The card that advertises the lobby: the env's own, else one of its children's (an env behind a gateway)."""
+def _card(deployed: DeployedEnv, uri: str) -> dict:
+    """The card that advertises `uri`: the env's own, else one of its children's (an env behind a gateway)."""
     own = deployed.environment_card or {}
-    card = next((c for c in [own, *(own.get("children_environments") or [])] if client.find_extension(c, LOBBY)), None)
+    card = next((c for c in [own, *(own.get("children_environments") or [])] if client.find_extension(c, uri)), None)
     if card is None:
-        raise RuntimeError(f"env {deployed.env_id!r} has no lobby ({LOBBY}): it is not a game env")
+        raise RuntimeError(f"env {deployed.env_id!r} doesn't serve {uri}: it is not a game env")
     return card

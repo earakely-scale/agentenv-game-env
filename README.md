@@ -7,8 +7,10 @@ every game env one way to say who they are:
   occupant at a time before the game is created. An occupant is an agent, a person, or the game's own AI.
 - **`AgentEnvGameEnv`**, the base class that serves the lobby and tells each request which slot it plays. A game marks
   its own parts of the lobby with decorators.
-- **Three task steps**, `create_match`, `add_player_slot` and `start_match`, that open, fill and close the lobby of
-  any game env built on it.
+- **A license**, `urn:game:license/v1`, for a game that needs something from its user to run (license files, keys,
+  terms to accept), which must never be in its image, a task file or a reply.
+- **Four task steps**: `add_license` gives a game its license from agent-env's secret store, and `create_match`,
+  `add_player_slot` and `start_match` open, fill and close the lobby of any game env built on it.
 
 The same task steps then seat players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent. Warcraft III's env, in
@@ -219,6 +221,7 @@ A refusal is an HTTP 400 with the protocol's error body, `{"ok": false, "error":
 | `bad_occupant` | an occupant that isn't valid, or a person in a game that takes none |
 | `bad_settings` | the game refused the lobby's or the slot's settings; the message says why |
 | `too_few_slots` | close with fewer than `min` slots |
+| `not_licensed` | close while the game lacks part of its license ([Licenses](#licenses-urngamelicensev1)) |
 | `bad_request` | a body that isn't a JSON object, or that has unknown fields |
 
 If creating the game fails, `close` answers 500 with `lobby_failed`. The lobby stays open, so the close can be retried.
@@ -238,6 +241,8 @@ Subclass `AgentEnvGameEnv` and mark the game's parts of the lobby, the way agent
 | `@check_slot` | before the lobby takes a slot | `slot`, `lobby` | nothing; raise `ValueError` to refuse | optional |
 | `@connect_slot` | for an agent slot | `slot` | a `Connect` | optional; default `/players/<name>/mcp` |
 | `@play_link` | for a human slot | `slot` | a link | optional; without it, the game takes no people |
+| `@license_needs` | for the license's status, and before the lobby closes | nothing | the `LicenseItem`s the game still lacks; empty when licensed | optional, with `@install_license` |
+| `@install_license` | when parts arrive | `parts`: a `LicenseParts` | nothing; raise `ValueError` to refuse a part | with `@license_needs` |
 
 - **One method per decorator, across the class and its bases.** The method name is yours.
 - **A `ValueError` from your method is the caller's `bad_settings`,** with your message.
@@ -256,6 +261,9 @@ the player routing (the SDK serves one handler per extension, so the lobby's oth
 `mount()` onto an app of your own isn't supported.
 
 ## The task steps
+
+**`add_license`** gives a licensed game its license: [Licenses](#the-add_license-step). Put it before
+`start_match`.
 
 **`create_match`** opens the lobby for a match:
 
@@ -294,6 +302,107 @@ the player routing (the SDK serves one handler per extension, so the lobby's oth
 **`start_match`** closes the lobby, which creates the game. It takes `env_id` and `timeout_seconds` (default `900`).
 Put it after every `add_player_slot` of the game and before its players play. The closed lobby and the game's report
 are kept in `metadata["game_lobby"]`.
+
+## Licenses: `urn:game:license/v1`
+
+Some games need something from their user before they run: Warcraft III its activation files, others a serial number,
+a server token, or terms someone has to accept. None of it may be in the env's image, in a task file or in anything the
+env replies. A game says what it still lacks, and the `add_license` step gives it, from agent-env's secret store.
+
+### What a license is made of
+
+A license is one or more parts, each one of three kinds:
+
+| Kind | What it is | Examples | In the secret store | The game receives |
+|---|---|---|---|---|
+| `file` | bytes the game needs as a file; it decides where | Warcraft III's `roc.w3k` and `tft.w3k`; a `.lic` file | the file's base64 | `bytes` |
+| `key` | a secret string | a serial number, a license key, a server token, a password | the text itself | `str` |
+| `acceptance` | terms someone has to agree to; not a secret | a game's terms for AI research use | nothing: the task states it | its name |
+
+Each part is a `LicenseItem`:
+
+| Field | |
+|---|---|
+| `name`, `kind` | the part, and which of the three it is |
+| `group` | the license it belongs to, when one license has several parts: two files, or a user and a password |
+| `description` | where to get it, shown when it is missing |
+| `max_bytes` | a file: no larger than this |
+| `pattern` | a key: the format it must match (the key is never echoed) |
+| `terms_url` | an acceptance: the terms agreed to |
+
+### The game side
+
+```python
+from agentenv_game import LicenseItem, LicenseParts, install_license, license_needs
+
+@license_needs
+def needs(self) -> list[LicenseItem]:   # what the game still lacks; [] once it's licensed
+    return [LicenseItem(name=n, kind="file", group="warcraft3", max_bytes=4096,
+                        description=f"{n} from your Warcraft III folder")
+            for n in ("roc.w3k", "tft.w3k") if not (self.game_dir / n).exists()]
+
+@install_license
+def install(self, parts: LicenseParts) -> None:   # parts.files: bytes, parts.keys: str, parts.accepted: names
+    for name, data in parts.files.items():
+        (self.game_dir / name).write_bytes(data)
+```
+
+- **The game decides what counts as present.** A file it finds already mounted, or a key from a previous call,
+  doesn't appear in `license_needs`.
+- **Every part is checked against its item before `install_license` sees it:** the game lacks it, it's the right kind,
+  a file fits `max_bytes` and is valid base64, and a key matches `pattern`.
+- **The base class never keeps a part.** It records only the names it passed on.
+- **A lobby doesn't close while anything is missing.** The game gets `not_licensed`, with each missing part and where
+  to get it.
+
+`tests/test_license.py` has a version of tic-tac-toe that needs one part of each kind.
+
+### On the wire
+
+| Method | Route | Request | Response |
+|---|---|---|---|
+| `get` | `GET /agentenv/ext/license` | | `{"missing": [<LicenseItem>...], "installed": [<names>]}` |
+| `add` | `POST /agentenv/ext/license/add` | `{"files": {name: base64}, "keys": {name: text}, "accept": [names]}` | the same status |
+
+A part the game refuses is `bad_license`, with the reason. A key is never part of a reply, not even in an error.
+
+### The `add_license` step
+
+```jsonc
+// Warcraft III: one license of two files
+{"id": "license", "type": "add_license", "env_id": "wc3",
+ "files": {"roc.w3k": "WC3_ROC_W3K", "tft.w3k": "WC3_TFT_W3K"}}
+// a serial number, a store login (one license, two keys), terms to accept
+{"id": "license", "type": "add_license", "env_id": "some-game",
+ "keys": {"serial": "SOME_GAME_SERIAL", "user": "STORE_USER", "password": "STORE_PASSWORD"},
+ "accept": ["some-game-research-terms"]}
+```
+
+| Field | |
+|---|---|
+| `files`, `keys` | each part's name → the secret that holds it: a file's base64, a key's text |
+| `accept` | the terms the task agrees to, by name |
+| `timeout_seconds` | default `60` |
+
+What the step does:
+1. **Ask the env what it lacks.** If nothing, it reads no secrets at all.
+2. **Check the task gives every missing part before reading any secret.** A missing part the task doesn't map fails
+   the step, naming the part and where to get it.
+3. **Read only those secrets, and send them.** A secret the store doesn't have fails the step, naming the secret.
+4. **Keep only the names** in the run's `metadata["game_license"]`.
+
+**Two choices worth knowing:**
+- **The task names the secrets, not the env.** An env that could name them could ask for any secret, a model key say,
+  and the step would send it. As it is, a task shows exactly which secrets go to which env.
+- **No local files.** A task that could name a file on the machine running it could send any file to an env. Put the
+  file in the secret store instead. agent-env's default secret store reads environment variables, so
+  `export WC3_ROC_W3K=$(base64 < roc.w3k)` is enough.
+
+**Not covered yet:**
+- **Alternatives,** like "a license file *or* a serial". A game can ask for whichever it prefers.
+- **Licensed files too big for a secret store.** Cloud stores cap a secret at about 64 KB. A part could later come from
+  an artifact.
+- **The game's own licensed install.** That belongs in an image you build privately.
 
 ## Development
 

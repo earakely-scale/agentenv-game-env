@@ -1,6 +1,7 @@
-"""`AgentEnvGameEnv`, the base of a game env: it serves the lobby (`urn:game:lobby/v1`) and tells each request which
-player slot it plays. A game marks its parts of the lobby with decorators, as agentenv-protocol's data plane marks
-`@reset_data`: `@create_game` (required), `@open_lobby`, `@check_slot`, `@connect_slot`, `@play_link`."""
+"""`AgentEnvGameEnv`, the base of a game env: it serves the lobby (`urn:game:lobby/v1`) and the license
+(`urn:game:license/v1`), and tells each request which player slot it plays. A game marks its parts with decorators, as
+agentenv-protocol's data plane marks `@reset_data`: `@create_game` (required), `@open_lobby`, `@check_slot`,
+`@connect_slot`, `@play_link`, and for a licensed game `@license_needs` with `@install_license`."""
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .license import LICENSE, LicenseItem, parts_for
 from .lobby import (
     LOBBY,
     Connect,
@@ -34,7 +36,7 @@ from .routing import PLAYERS, PlayerPaths, current_player
 log = logging.getLogger(__name__)
 _HOOK = "_agentenv_game_hook"
 HOOKS = {"open_lobby": (2, False), "check_slot": (2, False), "create_game": (1, True), "connect_slot": (1, False),
-         "play_link": (1, False)}
+         "play_link": (1, False), "license_needs": (0, False), "install_license": (1, False)}
 """Each decorator's method: its parameters after self, and whether it is a coroutine."""
 
 ROUTE = f"{RPC_PATH}/ext/lobby"
@@ -48,6 +50,19 @@ PARAMS = {"endpoint": ROUTE, "methods": {
     "get": {"method": "GET", "endpoint": ROUTE},
     "fill": {"method": "POST", "endpoint": f"{ROUTE}/fill", "request": SlotRequest.model_json_schema()},
     "close": {"method": "POST", "endpoint": f"{ROUTE}/close"}}}
+
+
+LICENSE_ROUTE = f"{RPC_PATH}/ext/license"
+LICENSE_DESCRIPTION = ("What the game needs from its user to run (license files, keys, terms to accept) and still "
+                       "lacks: get lists it, by name and kind, never the contents; add gives it.")
+LICENSE_PARAMS = {"endpoint": LICENSE_ROUTE, "methods": {
+    "get": {"method": "GET", "endpoint": LICENSE_ROUTE},
+    "add": {"method": "POST", "endpoint": f"{LICENSE_ROUTE}/add", "request": {
+        "type": "object", "additionalProperties": False,
+        "properties": {"files": {"type": "object", "additionalProperties": {"type": "string"},
+                                 "description": "file name → its contents in base64"},
+                       "keys": {"type": "object", "additionalProperties": {"type": "string"}},
+                       "accept": {"type": "array", "items": {"type": "string"}}}}}}}
 
 
 def _mark(fn: Callable, hook: str) -> Callable:
@@ -85,6 +100,19 @@ def play_link(fn: Callable) -> Callable:
     return _mark(fn, "play_link")
 
 
+def license_needs(fn: Callable) -> Callable:
+    """The method that says what the game still lacks to run, `()`, as LicenseItems: files, keys and acceptances.
+    An empty list means it is licensed; a lobby doesn't close until it is. A game with it has `@install_license`."""
+    return _mark(fn, "license_needs")
+
+
+def install_license(fn: Callable) -> Callable:
+    """The method that puts the parts of a license where the game wants them, `(parts)`: a LicenseParts of files
+    (bytes), keys (strings) and acceptances, each already checked against the item it fills. Raise ValueError to
+    refuse one."""
+    return _mark(fn, "install_license")
+
+
 class AgentEnvGameEnv(AgentEnvEnvironment):
     """A game env. Its lobby takes the next game's players, one slot at a time, and closing it creates the game;
     `player()` is the slot the current request plays, by its `/players/<name>` address or, with `player_header`, by
@@ -96,6 +124,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
     _lobby: Lobby | None = None
     _game: dict | None = None
     _closing: asyncio.Lock | None = None
+    _installed: list[str] | None = None
 
     def _hooks(self) -> dict[str, Callable]:
         """The game's marked methods, checked once: one per decorator, @create_game present, signatures as each
@@ -113,6 +142,9 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
         if "create_game" not in found:
             raise TypeError(f"{type(self).__name__} marks no @create_game method: a game env creates its game when "
                             "the lobby closes")
+        if ("license_needs" in found) != ("install_license" in found):
+            raise TypeError(f"{type(self).__name__} marks only one of @license_needs and @install_license: a game "
+                            "that needs a license installs it")
         for hook, (attr, fn) in found.items():
             count, coroutine = HOOKS[hook]
             given = [p for p in inspect.signature(fn).parameters.values()
@@ -184,9 +216,34 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
             lobby = self.lobby
             if lobby.state is LobbyState.OPEN:
                 lobby.check_close()
+                if missing := self.license_missing():
+                    raise LobbyError("not_licensed", f"the game lacks {', '.join(i.label() for i in missing)}: an "
+                                                     "add_license step gives a game its license")
                 self._game = await self._hooks()["create_game"](lobby) or {}
                 lobby.state = LobbyState.CLOSED
             return {**lobby.model_dump(mode="json", exclude_none=True), "game": self._game}
+
+    def license_missing(self) -> list[LicenseItem]:
+        """What the game still lacks to run (its `@license_needs`); nothing for a game that needs no license."""
+        hook = self._hooks().get("license_needs")
+        return [i if isinstance(i, LicenseItem) else LicenseItem(**i) for i in hook()] if hook else []
+
+    def add_license(self, files: dict | None = None, keys: dict | None = None, accept: list | None = None) -> dict:
+        """Give the game parts of its license: files as base64, keys as strings, acceptances by name. Each is checked
+        against the item it fills, then the game's `@install_license` puts them in place."""
+        parts = parts_for(self.license_missing(), files or {}, keys or {}, accept or [])
+        if parts.files or parts.keys or parts.accepted:
+            try:
+                self._hooks()["install_license"](parts)
+            except (ValueError, ValidationError) as e:
+                raise LobbyError("bad_license", str(e)) from e
+            self._installed = sorted({*(self._installed or ()), *parts.files, *parts.keys, *parts.accepted})
+        return self.license_status()
+
+    def license_status(self) -> dict:
+        """What the game lacks and what it was given, by name: never a part's contents."""
+        return {"missing": [i.model_dump(mode="json", exclude_none=True) for i in self.license_missing()],
+                "installed": list(self._installed or ())}
 
     def player(self) -> PlayerSlot | None:
         """The agent slot the current request plays; None at the env's own address. A name without one is refused."""
@@ -234,6 +291,20 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
     async def _close(self, params: dict) -> dict:
         return await self.close_lobby()
 
+    # ---- urn:game:license/v1: get, served by the SDK, and add, a route of create_app's ----
+
+    @extension(LICENSE, params=LICENSE_PARAMS, description=LICENSE_DESCRIPTION, method="GET", path=LICENSE_ROUTE)
+    async def license_get(self) -> dict:
+        return self.license_status()
+
+    async def _add_license(self, params: dict) -> dict:
+        if unknown := sorted(set(params) - {"files", "keys", "accept"}):
+            raise LobbyError("bad_request", f"add takes files, keys and accept, not {unknown}")
+        files, keys, accept = params.get("files") or {}, params.get("keys") or {}, params.get("accept") or []
+        if not (isinstance(files, dict) and isinstance(keys, dict) and isinstance(accept, list)):
+            raise LobbyError("bad_request", "files and keys are objects of name → value, accept a list of names")
+        return self.add_license(files, keys, accept)
+
     def _route(self, call: Callable[[dict], Awaitable[dict]]) -> Callable:
         async def handler(request: Request) -> JSONResponse:
             try:
@@ -256,6 +327,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
         app = super().create_app()
         for method, call in (("open", self._open), ("fill", self._fill), ("close", self._close)):
             app.custom_route(f"{ROUTE}/{method}", methods=["POST"])(self._route(call))
+        app.custom_route(f"{LICENSE_ROUTE}/add", methods=["POST"])(self._route(self._add_license))
         routes, header = app.streamable_http_app, self.player_header
         app.streamable_http_app = lambda: PlayerPaths(routes(), header=header)
         return app
