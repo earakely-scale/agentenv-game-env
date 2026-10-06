@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentenv-game-env"
+version = "0.1.0"
+description = "Game envs for AgentEnv: a lobby of player slots that agents, people and the game's own AI fill, a base class that serves it, and the task steps that fill it."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["agentenv", "mcp", "games", "multi-agent", "llm-agents", "reinforcement-learning"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "agentenv-framework>=0.9.1260",
+    "agentenv-framework-protocol>=0.1.275,<0.2",
+    "httpx>=0.27,<1",
+    "mcp>=1.25,<2",
+    "pydantic>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-timeout>=2", "anyio>=4", "uvicorn>=0.30", "ruff>=0.16,<0.17"]
+
+[project.urls]
+Source = "https://github.com/earakely-scale/agentenv-game-env"
+
+[project.entry-points."agent_env.task_steps"]
+add_player_slot = "agentenv_game.steps:AddPlayerSlotTaskStep"
+start_match = "agentenv_game.steps:StartMatchTaskStep"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentenv_game"]
+
+[tool.pytest.ini_options]
+timeout = 120
+testpaths = ["tests"]
+pythonpath = ["examples"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
