@@ -1,5 +1,5 @@
-"""The lobby served over HTTP, as agentenv-protocol's client invokes it; each player slot's env card; and players' MCP
-clients reaching their player slots at the addresses those cards give."""
+"""The lobby and the match served over HTTP, as agentenv-protocol's client invokes them; each player slot's env card;
+and players' MCP clients reaching their player slots at the addresses those cards give."""
 
 from contextlib import asynccontextmanager
 
@@ -9,9 +9,10 @@ from agentenv_protocol import client
 from conftest import deployed
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from test_match import Race
 from tictactoe import TicTacToe
 
-from agentenv_game import LOBBY
+from agentenv_game import LOBBY, MATCH
 
 pytestmark = pytest.mark.anyio
 
@@ -53,6 +54,7 @@ async def test_the_card_advertises_every_method_and_the_games_settings():
         await fill(env, player_id="o", player_kind="ai")
         closed = await client.invoke_extension(base, card, LOBBY, {"lobby_id": opened["lobby_id"]}, method="close")
         assert closed["status"] == "closed" and "game" not in closed and len(closed["player_slots"]) == 2
+        assert closed["player_teams"] == [{"team_id": "x", "player_ids": ["x"]}, {"team_id": "o", "player_ids": ["o"]}]
         assert (await client.invoke_extension(base, card, LOBBY, method="get"))["status"] == "closed"
 
 
@@ -113,7 +115,12 @@ async def test_each_player_plays_its_own_slot_by_its_address():
             for who, cell in ((alice, 0), (bob, 3), (alice, 1), (bob, 4), (alice, 2)):
                 failed, text = await call(who, "mark", cell=cell)
                 assert not failed and "Not marked" not in text
+            assert "Not marked: the match is finished." in (await call(bob, "mark", cell=5))[1]
         assert game.winner == "x" and text.endswith("x won.")
+        match = await client.invoke_extension(base, env.environment_card, MATCH, method="get")
+        assert {k: match[k] for k in ("status", "status_detail", "player_states")} == {
+            "status": "finished", "status_detail": "x won",
+            "player_states": {"x": {"status": "won"}, "o": {"status": "lost"}}}
         async with player(base, "/players/carol/mcp") as carol:
             failed, text = await call(carol, "show_board")
             assert failed and "no player slot 'carol' is played here; this game's are x, o" in text
@@ -158,3 +165,63 @@ async def test_a_game_that_fails_to_create_leaves_the_lobby_failed_and_cancel_en
         opened = (await http.post(f"{lobby}/open", json={})).json()
         cancelled = await http.post(f"{lobby}/cancel", json={"lobby_id": opened["lobby_id"]})
         assert cancelled.json()["status"] == "cancelled" and cancelled.json()["lobby_id"] == opened["lobby_id"]
+
+
+async def test_the_match_over_http():
+    async with deployed(TicTacToe()) as env, httpx.AsyncClient() as http:
+        card, base = env.environment_card, env.environment_url
+        methods = client.extension_params(card, MATCH)["methods"]
+        assert {m: (v["method"], v["endpoint"]) for m, v in methods.items()} == {
+            "get": ("GET", "/agentenv/ext/match"), "player_ready": ("POST", "/agentenv/ext/match/player_ready"),
+            "finish": ("POST", "/agentenv/ext/match/finish"), "cancel": ("POST", "/agentenv/ext/match/cancel")}
+        match = f"{base}/agentenv/ext/match"
+
+        async def post(method, body):
+            response = await http.post(f"{match}/{method}", json=body)
+            return response.status_code, response.json().get("error", {}).get("code")
+
+        assert (await http.get(match)).json() is None
+        assert await post("finish", {}) == (400, "no_match")
+        opened = await client.invoke_extension(base, card, LOBBY, {}, method="open")
+        await fill(env, player_id="x", player_kind="agent", player_name="alice")
+        await fill(env, player_id="o", player_kind="ai")
+        await client.invoke_extension(base, card, LOBBY, {}, method="close")
+        assert await client.invoke_extension(base, card, MATCH, method="get") == {
+            "lobby_id": opened["lobby_id"], "status": "started",
+            "progress": [{"name": "game", "unit": "moves", "value": 0, "limit": 9}],
+            "player_states": {"x": {"status": "undecided"}, "o": {"status": "undecided"}}}
+        for method, body, code in (("player_ready", {}, "bad_request"),
+                                   ("player_ready", {"player_id": "z"}, "bad_player"),
+                                   ("player_ready", {"player_id": 1}, "bad_request"),
+                                   ("finish", {"lobby_id": "lb-old"}, "lobby_replaced"),
+                                   ("cancel", {"reason": "x"}, "bad_request")):
+            assert await post(method, body) == (400, code), (method, body)
+        ready = await client.invoke_extension(base, card, MATCH, {"player_id": "x"}, method="player_ready")
+        assert ready["status"] == "started"
+        finished = await client.invoke_extension(base, card, MATCH, {"lobby_id": opened["lobby_id"]}, method="finish")
+        assert (finished["status"], finished["status_detail"]) == (
+            "cancelled", "tictactoe can't be played out without its players")
+        assert await client.invoke_extension(base, card, MATCH, {}, method="cancel") == finished
+
+
+async def test_a_gated_match_starts_once_its_players_say_they_are_ready_and_a_broken_play_out_answers_500():
+    game = Race()
+    async with deployed(game) as env, httpx.AsyncClient() as http:
+        card, base = env.environment_card, env.environment_url
+        await client.invoke_extension(base, card, LOBBY, {}, method="open")
+        await fill(env, player_id="a", player_kind="agent", player_name="alice")
+        await fill(env, player_id="c", player_kind="ai")
+        await client.invoke_extension(base, card, LOBBY, {}, method="close")
+        waiting = await client.invoke_extension(base, card, MATCH, method="get")
+        assert waiting["status"] == "not_started" and waiting["player_states"]["a"]["status"] == "not_ready"
+        started = await client.invoke_extension(base, card, MATCH, {"player_id": "a"}, method="player_ready")
+        assert started["status"] == "started" and game.begun == 1
+
+        async def broken():
+            raise RuntimeError("the engine stopped")
+
+        game._hooks()["play_out"] = broken
+        failed = await http.post(f"{base}/agentenv/ext/match/finish", json={})
+        assert failed.status_code == 500 and failed.json()["error"] == {
+            "code": "match_failed", "message": "RuntimeError: the engine stopped"}
+        assert (await http.get(f"{base}/agentenv/ext/match")).json()["status"] == "failed"

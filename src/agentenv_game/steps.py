@@ -1,6 +1,7 @@
 """A game env's task steps: `add_license` gives the game the license it lacks, from agent-env's secret store;
-`create_match` opens its lobby with the game's settings, `add_player_slot` fills one player slot and gives an agent its
-slot's MCP address, read from the slot's env card, and `start_match` closes the lobby, which creates the game."""
+`open_lobby` opens its lobby with the game's settings, `add_player_slot` fills one player slot and gives an agent its
+slot's MCP address, read from the slot's env card, and `close_lobby` closes the lobby, which creates the game and its
+match; `finish_match` plays the match out once its agents have stopped, and `cancel_match` ends it where it stands."""
 
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ from pydantic import ValidationError
 
 from .license import LICENSE, LicenseItem, LicenseKind
 from .lobby import LOBBY, PlayerKind, PlayerSlot, PlayerSlotLimits, SlotRequest
+from .match import MATCH
 
 PAGE = "http"
 """A player slot's interface for a person: a page to open."""
@@ -36,7 +38,7 @@ class AddLicenseTaskStep(TaskStep):
     and `keys` map each part's name to the secret holding it: a file's secret holds its base64, a key's the key
     itself. `accept` lists the terms the task agrees to. The step asks the env what it lacks first, then reads only
     those secrets, and none when it lacks nothing. A lobby doesn't close while its game lacks its license, so put this
-    before start_match. The parts' names go in the run's `metadata["game_license"]`; their contents go nowhere else."""
+    before close_lobby. The parts' names go in the run's `metadata["game_license"]`; their contents go nowhere else."""
 
     type: ClassVar[str] = "add_license"
     entity_refs = (EntityRef.env("env_id"),)
@@ -93,14 +95,14 @@ class AddLicenseTaskStep(TaskStep):
         return context
 
 
-class CreateMatchTaskStep(TaskStep):
+class OpenLobbyTaskStep(TaskStep):
     """Open a deployed game env's lobby for a match: `game_settings` are the game's own (WC3: map, seed,
     time_limit_seconds, mode), as its card's open request describes them, and `player_slot_limits` optionally narrow
     its player slots ({min, max}). The env fills in its defaults and refuses what it doesn't take. A run's step
     overrides merge into `game_settings` and replace `player_slot_limits`. The opened lobby, with its `lobby_id`, is
     kept in the run's `metadata["game_lobby"]`."""
 
-    type: ClassVar[str] = "create_match"
+    type: ClassVar[str] = "open_lobby"
     entity_refs = (EntityRef.env("env_id"),)
 
     def __init__(self, id: str, version: int | None, env_id: str, game_settings: dict | None = None,
@@ -108,12 +110,12 @@ class CreateMatchTaskStep(TaskStep):
                  fail_task_on_error: bool = True):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         if game_settings is not None and not isinstance(game_settings, dict):
-            raise ValueError("create_match game_settings is an object")
+            raise ValueError("open_lobby game_settings is an object")
         try:
             if player_slot_limits is not None:
                 PlayerSlotLimits(**player_slot_limits)
         except (TypeError, ValidationError) as e:
-            raise ValueError(f"create_match player_slot_limits: {e}") from e
+            raise ValueError(f"open_lobby player_slot_limits: {e}") from e
         self.env_id, self.timeout_seconds = env_id, timeout_seconds
         self.game_settings = dict(game_settings or {})
         self.player_slot_limits = dict(player_slot_limits) if player_slot_limits is not None else None
@@ -123,7 +125,7 @@ class CreateMatchTaskStep(TaskStep):
                 "player_slot_limits": self.player_slot_limits, "timeout_seconds": self.timeout_seconds}
 
     @classmethod
-    def from_dict(cls, data: dict) -> CreateMatchTaskStep:
+    def from_dict(cls, data: dict) -> OpenLobbyTaskStep:
         return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", True)},
                    env_id=data["env_id"], **{k: data[k] for k in ("game_settings", "player_slot_limits",
                                                                   "timeout_seconds") if k in data})
@@ -137,7 +139,7 @@ class CreateMatchTaskStep(TaskStep):
                               self.timeout_seconds)
         context.metadata["game_lobby"] = lobby
         limits = lobby.get("player_slot_limits") or {}
-        log.info("create_match: %s opened lobby %s for %s to %s players (%s) with %s", self.env_id,
+        log.info("open_lobby: %s opened lobby %s for %s to %s players (%s) with %s", self.env_id,
                  lobby.get("lobby_id"), limits.get("min", 0), limits.get("max", "any number of"),
                  ", ".join(limits.get("player_kinds") or ()), lobby.get("game_settings"))
         return context
@@ -212,12 +214,12 @@ class AddPlayerSlotTaskStep(TaskStep):
         return context
 
 
-class StartMatchTaskStep(TaskStep):
-    """Close a deployed game env's lobby, which creates the game from its player slots. Put it after every
-    add_player_slot step of the game and before its players play; closing a closed lobby returns it again. The closed
-    lobby is kept in the run's `metadata["game_lobby"]`."""
+class CloseLobbyTaskStep(TaskStep):
+    """Close a deployed game env's lobby, which creates the game and its match from its player slots. Put it after
+    every add_player_slot step of the game and before its players play; closing a closed lobby returns it again. The
+    closed lobby is kept in the run's `metadata["game_lobby"]`."""
 
-    type: ClassVar[str] = "start_match"
+    type: ClassVar[str] = "close_lobby"
     entity_refs = (EntityRef.env("env_id"),)
 
     def __init__(self, id: str, version: int | None, env_id: str, timeout_seconds: int = 900,
@@ -229,7 +231,7 @@ class StartMatchTaskStep(TaskStep):
         return {**super().to_dict(), "env_id": self.env_id, "timeout_seconds": self.timeout_seconds}
 
     @classmethod
-    def from_dict(cls, data: dict) -> StartMatchTaskStep:
+    def from_dict(cls, data: dict) -> CloseLobbyTaskStep:
         return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", True)},
                    env_id=data["env_id"], **({"timeout_seconds": data["timeout_seconds"]}
                                              if "timeout_seconds" in data else {}))
@@ -240,9 +242,63 @@ class StartMatchTaskStep(TaskStep):
         result = await _invoke(deployed, LOBBY, "close", {"lobby_id": lobby_id} if lobby_id else {},
                                self.timeout_seconds)
         context.metadata["game_lobby"] = result
-        log.info("start_match: %s created its game with %d players", self.env_id,
+        log.info("close_lobby: %s created its game with %d players", self.env_id,
                  len(result.get("player_slots") or ()))
         return context
+
+
+class _EndMatchTaskStep(TaskStep):
+    """End a deployed game env's match with the match protocol's `method`; the final match is kept in the run's
+    `metadata["game_match"]`."""
+
+    method: ClassVar[str]
+    default_timeout: ClassVar[int]
+
+    def __init__(self, id: str, version: int | None, env_id: str, timeout_seconds: int | None = None,
+                 depends_on: list | None = None, fail_task_on_error: bool = True):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        self.env_id, self.timeout_seconds = env_id, timeout_seconds or self.default_timeout
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "env_id": self.env_id, "timeout_seconds": self.timeout_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> _EndMatchTaskStep:
+        return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", True)},
+                   env_id=data["env_id"], timeout_seconds=data.get("timeout_seconds"))
+
+    async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        deployed = _deployed(context, self.env_id)
+        lobby_id = (context.metadata.get("game_lobby") or {}).get("lobby_id")
+        match = await _invoke(deployed, MATCH, self.method, {"lobby_id": lobby_id} if lobby_id else {},
+                              self.timeout_seconds)
+        context.metadata["game_match"] = match
+        log.info("%s: %s's match is %s%s", self.type, self.env_id, match["status"],
+                 f" ({match['status_detail']})" if match.get("status_detail") else "")
+        return context
+
+
+class FinishMatchTaskStep(_EndMatchTaskStep):
+    """Play a deployed game env's match out once its agents have stopped, before it is graded: put it after every
+    prompt_agent step of the match. The game takes no more moves from its players and runs the match to the end its
+    rules or limit set, so every match is graded at its end; a game that can't play out without its players ends it
+    cancelled. A match already over is left as it is. `timeout_seconds` (default 7200) covers a realtime game's
+    remaining time."""
+
+    type: ClassVar[str] = "finish_match"
+    entity_refs = (EntityRef.env("env_id"),)
+    method = "finish"
+    default_timeout = 7200
+
+
+class CancelMatchTaskStep(_EndMatchTaskStep):
+    """End a deployed game env's match where it stands: cancelled, every player without an outcome undecided. A match
+    already over is left as it is."""
+
+    type: ClassVar[str] = "cancel_match"
+    entity_refs = (EntityRef.env("env_id"),)
+    method = "cancel"
+    default_timeout = 60
 
 
 async def _slot_card(base: str, headers: dict, timeout: int) -> dict:
@@ -296,7 +352,7 @@ def _agent(context: TaskStepContext, name: str) -> DeployedAgent:
 
 async def _invoke(deployed: DeployedEnv, uri: str, method: str, params: dict, timeout: int) -> dict:
     card = _card(deployed, uri)
-    what = "license" if uri == LICENSE else "lobby"
+    what = {LICENSE: "license", LOBBY: "lobby", MATCH: "match"}[uri]
     try:
         return await client.invoke_extension(deployed.environment_url, card, uri, params, timeout=timeout,
                                              method=method)

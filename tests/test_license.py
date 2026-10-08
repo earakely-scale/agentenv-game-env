@@ -15,9 +15,9 @@ from tictactoe import TicTacToe
 from agentenv_game import (
     LICENSE,
     AgentEnvGameEnv,
+    GameError,
     LicenseItem,
     LicenseParts,
-    LobbyError,
     SlotRequest,
     create_game,
     install_license,
@@ -63,7 +63,7 @@ def filled(game) -> None:
 
 
 def refused(code, call, *args, **kwargs):
-    with pytest.raises(LobbyError) as e:
+    with pytest.raises(GameError) as e:
         call(*args, **kwargs)
     assert e.value.code == code, e.value
     return e.value.message
@@ -79,7 +79,7 @@ async def test_a_game_without_a_license_needs_nothing():
 async def test_the_lobby_does_not_close_until_every_part_is_given():
     game = Licensed()
     filled(game)
-    with pytest.raises(LobbyError) as e:
+    with pytest.raises(GameError) as e:
         await game.close_lobby()
     assert e.value.code == "not_licensed" and "file board.lic (from your purchase)" in e.value.message
     assert "acceptance ttt-terms (https://example.com/terms)" in e.value.message

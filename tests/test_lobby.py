@@ -1,5 +1,6 @@
 """The lobby on the example game, in process: its life from not opened to closed, cancelled or failed, the shared
-checks and the game's, settings checked against the game's models, player slot cards, and the decorators' rules."""
+checks and the game's, settings checked against the game's models, player slot cards, teams, and the decorators'
+rules."""
 
 import pytest
 from agentenv_protocol import environment_card
@@ -9,15 +10,19 @@ from tictactoe import TicTacToe
 
 from agentenv_game import (
     AgentEnvGameEnv,
-    LobbyError,
+    GameError,
     LobbyStatus,
     PlayerKind,
     PlayerSlotLimits,
+    PlayerTeam,
     SlotRequest,
+    begin_game,
     check_player_slot,
     create_game,
+    match_report,
     player_slot_card,
     player_slot_limits,
+    player_teams,
 )
 
 pytestmark = pytest.mark.anyio
@@ -32,14 +37,14 @@ def ai(player_id, **more):
 
 
 def refused(code, call, *args, **kwargs):
-    with pytest.raises(LobbyError) as e:
+    with pytest.raises(GameError) as e:
         call(*args, **kwargs)
     assert e.value.code == code, e.value
     return e.value.message
 
 
 async def refused_async(code, call, *args):
-    with pytest.raises(LobbyError) as e:
+    with pytest.raises(GameError) as e:
         await call(*args)
     assert e.value.code == code, e.value
     return e.value.message
@@ -142,6 +147,13 @@ class Arena(AgentEnvGameEnv):
                                    additionalInterfaces=[EnvironmentInterface(url="/play", transport="http")])
         return {"name": f"arena/{slot.player_id}", "additionalInterfaces": [{"url": "/mcp", "transport": "mcp"}]}
 
+    @player_teams
+    def by_faction(self, lobby):
+        factions: dict[str, list[str]] = {}
+        for slot in lobby.player_slots:
+            factions.setdefault(slot.game_settings["faction"], []).append(slot.player_id)
+        return [PlayerTeam(team_id=f, player_ids=ids) for f, ids in factions.items()]
+
     @create_game
     async def start(self, lobby):
         self.created = True
@@ -170,6 +182,31 @@ def test_player_slot_cards():
     arena.new_lobby()
     arena.fill_slot(SlotRequest(player_id="dana", player_kind="human", player_name="dana"))
     assert arena.slot_card("dana")["additionalInterfaces"] == [{"url": "/play", "transport": "http"}]
+
+
+async def test_teams_are_one_per_player_slot_unless_the_game_puts_players_together():
+    game = opened()
+    game.fill_slot(agent("x", "alice"))
+    game.fill_slot(ai("o"))
+    assert game.lobby.player_teams == [PlayerTeam(team_id="x", player_ids=["x"]),
+                                       PlayerTeam(team_id="o", player_ids=["o"])]
+    arena = Arena()
+    arena.new_lobby()
+    for player_id, faction in (("red", "orc"), ("blue", "orc"), ("green", "elf")):
+        arena.fill_slot(agent(player_id, player_id, game_settings={"faction": faction}))
+    assert arena.lobby.player_teams == [PlayerTeam(team_id="orc", player_ids=["red", "blue"]),
+                                        PlayerTeam(team_id="elf", player_ids=["green"])]
+    assert (await arena.close_lobby()).player_teams == arena.lobby.player_teams
+
+    class Lonely(Arena):
+        @player_teams
+        def by_faction(self, lobby):
+            return []
+
+    lonely = Lonely()
+    lonely.new_lobby()
+    with pytest.raises(ValueError, match="every player slot on exactly one team"):
+        lonely.fill_slot(agent("red", "alice"))
 
 
 async def test_a_lobby_closes_only_with_enough_players():
@@ -272,3 +309,26 @@ def test_the_decorators_rules():
         NotAsync().create_app()
     with pytest.raises(TypeError, match="@player_slot_limits limits must be a plain method taking 2 arguments"):
         WrongArguments().create_app()
+
+    class MatchHooks(AgentEnvGameEnv):
+        @create_game
+        async def start(self, lobby):
+            pass
+
+        @begin_game
+        def go(self):
+            pass
+
+    class Report(MatchHooks):
+        @begin_game
+        async def go(self):
+            pass
+
+        @match_report
+        async def report(self):
+            pass
+
+    with pytest.raises(TypeError, match="@begin_game go must be an async method taking 0 arguments"):
+        MatchHooks().create_app()
+    with pytest.raises(TypeError, match="@match_report report must be a plain method taking 0 arguments"):
+        Report().create_app()

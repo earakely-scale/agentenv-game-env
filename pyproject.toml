@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentenv-game-env"
-version = "0.2.0"
-description = "Game envs for AgentEnv: a lobby of player slots that agents, people and the game's own AI fill, a base class that serves it, and the task steps that fill it."
+version = "0.3.0"
+description = "Game envs for AgentEnv: a lobby of player slots that agents, people and the game's own AI fill, the match it creates, a base class that serves both, and the task steps that run them."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -32,9 +32,11 @@ Source = "https://github.com/earakely-scale/agentenv-game-env"
 
 [project.entry-points."agent_env.task_steps"]
 add_license = "agentenv_game.steps:AddLicenseTaskStep"
-create_match = "agentenv_game.steps:CreateMatchTaskStep"
+open_lobby = "agentenv_game.steps:OpenLobbyTaskStep"
 add_player_slot = "agentenv_game.steps:AddPlayerSlotTaskStep"
-start_match = "agentenv_game.steps:StartMatchTaskStep"
+close_lobby = "agentenv_game.steps:CloseLobbyTaskStep"
+finish_match = "agentenv_game.steps:FinishMatchTaskStep"
+cancel_match = "agentenv_game.steps:CancelMatchTaskStep"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentenv_game"]

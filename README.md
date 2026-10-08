@@ -1,18 +1,21 @@
 # agentenv-game-env
 
-Game envs for [AgentEnv](https://github.com/scaleapi/agentenv-framework). A game has players, and this package gives
-every game env one way to say who they are:
+Game envs for [AgentEnv](https://github.com/scaleapi/agentenv-framework). A game has players and a course, and this
+package gives every game env one way to say who plays it and how it is going:
 
 - **A lobby**, `urn:game:lobby/v1`, that the env serves. It holds the next game's player slots, which are filled one
   player at a time before the game is created. A player is an agent, a person, or the game's own AI.
 - **An env card for each player slot** that an agent or a person plays: the env as that player sees it, with the
   interfaces it plays through.
-- **`AgentEnvGameEnv`**, the base class that serves both and tells each request which player slot it plays. A game
-  declares its settings as pydantic models and marks its own parts of the lobby with decorators.
+- **A match**, `urn:game:match/v1`, that the lobby's close creates: the game from its start gate to its end, with its
+  progress and each player's outcome and scores.
+- **`AgentEnvGameEnv`**, the base class that serves them and tells each request which player slot it plays. A game
+  declares its settings as pydantic models and marks its own parts of the lobby and the match with decorators.
 - **A license**, `urn:game:license/v1`, for a game that needs something from its user to run (license files, keys,
   terms to accept), which must never be in its image, a task file or a reply.
-- **Four task steps**: `add_license` gives a game its license from agent-env's secret store, and `create_match`,
-  `add_player_slot` and `start_match` open, fill and close the lobby of any game env built on it.
+- **Six task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
+  `add_player_slot` and `close_lobby` open, fill and close the lobby of any game env built on it; and `finish_match`
+  and `cancel_match` end its match.
 
 The same task steps then put players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent. Warcraft III's env, in
@@ -21,12 +24,12 @@ match's settings (map, seed, time limit, clock), and its player slots take a rac
 AI, a level.
 
 ```
-deploy_env ── create_match (opens the lobby with the game's settings)
+deploy_env ── open_lobby (with the game's settings)
                  ├─ add_player_slot {player_id: "2", ai, faction: "orc", team: 2}
                  ├─ deploy_agent p1 ── add_player_slot {player_id: "0", agent p1, faction: "human", team: 1} ──┐
                  └─ deploy_agent p2 ── add_player_slot {player_id: "1", agent p2, faction: "undead", team: 1} ─┤
-                                                                                                    start_match ── prompt_agent p1, p2
-                                                                                     (the lobby closes: the game is created)
+                                                                                                    close_lobby ── prompt_agent p1, p2 ── finish_match ── grade
+                                                                             (the game and its match are created)                (played out to its end)
 ```
 
 ## Install
@@ -37,18 +40,18 @@ It is not on PyPI yet:
 pip install "agentenv-game-env @ git+https://github.com/earakely-scale/agentenv-game-env"
 ```
 
-The env side (`AgentEnvGameEnv`, the lobby, the routing) needs only `agentenv-framework-protocol`, `mcp` and
+The env side (`AgentEnvGameEnv`, the lobby, the match, the routing) needs only `agentenv-framework-protocol`, `mcp` and
 `pydantic`. In an env image, install the package with `--no-deps` beside them. The task steps need `agentenv-framework`
 too.
 
 ## The example: tic-tac-toe
 
-[`examples/tictactoe.py`](examples/tictactoe.py) is a complete game env in about 100 lines. It has two players, `x` and
-`o`, each an agent or the game's AI. A player slot's id is its mark. The lobby part:
+[`examples/tictactoe.py`](examples/tictactoe.py) is a complete game env in about 120 lines. It has two players, `x` and
+`o`, each an agent or the game's AI. A player slot's id is its mark. The lobby and match parts:
 
 ```python
-from agentenv_game import AgentEnvGameEnv, LobbyError, PlayerKind, PlayerSlotLimits
-from agentenv_game import check_player_slot, create_game, player_slot_limits
+from agentenv_game import AgentEnvGameEnv, Counter, GameError, MatchReport, MatchStatus, PlayerKind, PlayerSlotLimits
+from agentenv_game import check_player_slot, create_game, match_report, player_slot_limits
 from agentenv_protocol import environment_card, tool
 
 
@@ -67,7 +70,7 @@ class TicTacToe(AgentEnvGameEnv):
     @check_player_slot                # the player slots are "x" and "o"
     def a_mark(self, slot, lobby):
         if slot.player_id not in ("x", "o"):
-            raise LobbyError("bad_slot", ...)
+            raise GameError("bad_slot", ...)
 
     @create_game                      # the lobby closed: set up the board, and let the AI move if it goes first
     async def new_game(self, lobby):
@@ -75,11 +78,21 @@ class TicTacToe(AgentEnvGameEnv):
         self.board, self.turn = [" "] * 9, lobby.game_settings["first"]
         ...
 
+    @match_report                     # how the match is going: read whenever the match is, kept once it's over
+    def report(self):
+        over = self.winner is not None
+        return MatchReport(
+            status="finished" if over else "started",
+            status_detail=(f"{self.winner} won" if self.winner in ("x", "o") else "a draw") if over else None,
+            progress=[Counter(name="game", unit="moves", value=9 - self.board.count(" "), limit=9)],
+            outcomes={...} if over else {})                    # "x": "won", "o": "lost"
+
     @tool()
     async def mark(self, cell: int):
         """Put your mark in a free cell on your turn: 0 to 8, top left to bottom right."""
         mine = self.player().player_id     # the player slot this request plays
-        ...
+        if self.match.status is MatchStatus.STARTED and ...:
+            ...
 ```
 
 ### Run it, and fill its lobby
@@ -93,8 +106,8 @@ L=http://127.0.0.1:18765/agentenv/ext/lobby
 curl -s -XPOST $L/open -d '{"game_settings": {"first": "x"}}'
 ```
 ```json
-{"lobby_id":"lb-444966b0","status":"open","game_settings":{"first":"x"},
- "player_slot_limits":{"min":2,"max":2,"player_kinds":["agent","ai"]},"player_slots":[]}
+{"lobby_id":"lb-cb04d0b9","status":"open","game_settings":{"first":"x"},
+ "player_slot_limits":{"min":2,"max":2,"player_kinds":["agent","ai"]},"player_slots":[],"player_teams":[]}
 ```
 
 An agent's player slot comes back with its environment. A second `x` is refused:
@@ -109,7 +122,8 @@ curl -s -XPOST $L/close
 {"player_id":"x","player_kind":"agent","player_name":"alice","game_settings":{},"environment_url":"/players/x","headers":{}}
 {"ok":false,"error":{"code":"slot_taken","message":"player slot 'x' is taken"}}               (HTTP 400)
 {"player_id":"o","player_kind":"ai","game_settings":{},"headers":{}}
-{"lobby_id":"lb-444966b0","status":"closed", ..., "player_slots":[...]}
+{"lobby_id":"lb-cb04d0b9","status":"closed", ..., "player_slots":[...],
+ "player_teams":[{"team_id":"x","player_ids":["x"]},{"team_id":"o","player_ids":["o"]}]}
 ```
 
 Alice's player slot serves its own env card at its `environment_url`:
@@ -139,6 +153,37 @@ x to play.
 The game's AI answered at once, in the top left. At `/players/carol/mcp` the tools refuse, because no player slot
 `carol` is played in this game. At the env's own `/mcp` they refuse too, because a request there plays no one.
 
+### Follow its match
+
+The match was created when the lobby closed. Tic-tac-toe has nothing to line up before the first move, so it started at
+once. Before the close, `GET` answers `null`:
+
+```bash
+M=http://127.0.0.1:18765/agentenv/ext/match
+curl -s $M          # after the close
+curl -s $M          # after alice plays 4, 2 and 6, and wins
+```
+```json
+{"lobby_id":"lb-cb04d0b9","status":"started","progress":[{"name":"game","unit":"moves","value":0,"limit":9}],
+ "player_states":{"x":{"status":"undecided"},"o":{"status":"undecided"}}}
+{"lobby_id":"lb-cb04d0b9","status":"finished","status_detail":"x won",
+ "progress":[{"name":"game","unit":"moves","value":5,"limit":9}],
+ "player_states":{"x":{"status":"won"},"o":{"status":"lost"}}}
+```
+
+A finished match never changes, and a mark refuses: `Not marked: the match is finished.` In a second game, alice
+stops after one mark and the harness finishes the match. Tic-tac-toe can't be played on without its players, so it
+ends `cancelled`:
+
+```bash
+curl -s -XPOST $M/finish -d '{"lobby_id": "lb-ba0bc889"}'
+```
+```json
+{"lobby_id":"lb-ba0bc889","status":"cancelled","status_detail":"tictactoe can't be played out without its players",
+ "progress":[{"name":"game","unit":"moves","value":2,"limit":9}],
+ "player_states":{"x":{"status":"undecided"},"o":{"status":"undecided"}}}
+```
+
 ### In an AgentEnv task
 
 Register the example as an MCP server env, as with any env (its image runs `python tictactoe.py`). A task then puts an
@@ -148,28 +193,30 @@ agent against the game's AI:
 [
   {"id": "deploy", "type": "deploy_env", "env_id": "tictactoe"},
   {"id": "agent", "type": "deploy_agent", "agent_name": "alice", "a2a_agent_id": "your-agent", "env_ids": []},
-  {"id": "match", "type": "create_match", "env_id": "tictactoe", "game_settings": {"first": "o"},
+  {"id": "lobby", "type": "open_lobby", "env_id": "tictactoe", "game_settings": {"first": "o"},
    "depends_on": ["deploy"]},
-  {"id": "slot-x", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match", "agent"],
+  {"id": "slot-x", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["lobby", "agent"],
    "player_id": "x", "player_kind": "agent", "player_name": "alice"},
-  {"id": "slot-o", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match"],
+  {"id": "slot-o", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["lobby"],
    "player_id": "o", "player_kind": "ai"},
-  {"id": "start", "type": "start_match", "env_id": "tictactoe", "depends_on": ["slot-x", "slot-o"]},
-  {"id": "play", "type": "prompt_agent", "agent_name": "alice", "depends_on": ["start"],
-   "prompt": "You play tic-tac-toe through the tools. Win."}
+  {"id": "close", "type": "close_lobby", "env_id": "tictactoe", "depends_on": ["slot-x", "slot-o"]},
+  {"id": "play", "type": "prompt_agent", "agent_name": "alice", "depends_on": ["close"],
+   "prompt": "You play tic-tac-toe through the tools. Win."},
+  {"id": "finish", "type": "finish_match", "env_id": "tictactoe", "depends_on": ["play"]}
 ]
 ```
 
 - **The agent deploys with `"env_ids": []`.** `add_player_slot` gives it its player slot's MCP address, so it plays
   `x`, not the env's own address.
 - **A second agent in place of the AI** makes it model against model: deploy `bob` and give him player slot `"o"`.
+- **`finish_match` leaves the final match** in the run's `metadata["game_match"]`, for a grader to read.
 
 ## The lobby protocol: `urn:game:lobby/v1`
 
 ### Lifecycle
 
 ```
-              open                   close                        the match (the game's business)
+              open                   close                        the match (urn:game:match/v1)
  not_opened ───────► open ──────────────────────────► closed ───► not_started → started → ...
                       │  fill ×N      ├─ cancel ─────► cancelled   (no game)
                       │               └─ the game can't be created ─► failed   (no game; close answers 500)
@@ -178,8 +225,8 @@ agent against the game's AI:
 
 - **`open`** starts a new, empty lobby with these settings and a new `lobby_id`, dropping the last lobby and its game.
 - **`fill`** adds one player while the lobby is open.
-- **`close`** creates the game from the filled player slots. After that the lobby is read-only, and the game is the
-  env's business (turns, start gates, results).
+- **`close`** creates the game and its match from the filled player slots. After that the lobby is read-only, and
+  the match takes over: [The match protocol](#the-match-protocol-urngamematchv1).
 - **`cancel`** abandons an open lobby, for a run that ends before its game starts.
 - **`closed`, `cancelled` and `failed` are final for that lobby.** Only a new `open` changes them. A game that can't be
   created from the slots fails the lobby: a retry opens a new one and fills it again.
@@ -202,14 +249,15 @@ JSON Schema, and `open`'s and `fill`'s include the game's own settings models, s
 | `cancel` | `POST /agentenv/ext/lobby/cancel` | `{"lobby_id": ...}`, optional | the lobby |
 
 **A `lobby_id` guards against a lobby opened since.** `fill`, `close` and `cancel` refuse a `lobby_id` that isn't the
-current lobby's (`lobby_replaced`). The task steps always send the one `create_match` opened.
+current lobby's (`lobby_replaced`). The task steps always send the one `open_lobby` opened.
 
 ### Types
 
 | Type | Fields |
 |---|---|
-| `Lobby` | `lobby_id`: new on each open. `status`: `LobbyStatus`, `not_opened`, `open`, `closed`, `cancelled` or `failed`. `game_settings`: the game's own (a map, a seed, a time limit), checked against its `GameSettings`, every default filled in. `player_slot_limits`: a `PlayerSlotLimits`. `player_slots`: the filled `PlayerSlot`s, in the order they were filled, which means nothing. |
+| `Lobby` | `lobby_id`: new on each open. `status`: `LobbyStatus`, `not_opened`, `open`, `closed`, `cancelled` or `failed`. `game_settings`: the game's own (a map, a seed, a time limit), checked against its `GameSettings`, every default filled in. `player_slot_limits`: a `PlayerSlotLimits`. `player_slots`: the filled `PlayerSlot`s, in the order they were filled, which means nothing. `player_teams`: the `PlayerTeam`s. |
 | `PlayerSlotLimits` | `min`: at close, at least this many player slots filled. `max`: no more than this many. `player_kinds`: the kinds of player the game takes, `["agent"]` by default. |
+| `PlayerTeam` | `team_id`: the game's own name for the team. `player_ids`: its members. Every player slot is on exactly one team: allies share one, opponents none. The game's `@player_teams` makes them, else each player slot is a team of its own. They follow the slots as they fill, so they are fixed when the lobby closes. |
 | `PlayerSlot` | `player_id`: the game's own name for the player slot (a player number, a role, a mark), which the protocol never interprets. `player_kind`: `PlayerKind`. `player_name`: who plays it; for an agent, the agent-env agent the slot is registered with; never for the game's AI. `game_settings`: the game's own for the slot (faction, team, AI level, a display label), checked against its `PlayerSlotSettings`. `environment_url`: for an agent or a person, where the player slot's env card is served. `headers`: what a client sends to reach it. |
 
 `player_id` and `player_name` are letters, digits, `_`, `.` and `-`, at most 64, so they can appear in paths and keys.
@@ -270,6 +318,90 @@ If creating the game fails, `close` answers 500 with `lobby_failed`, and the lob
 slot, and closing a closed lobby, or cancelling a cancelled one, returns it again. A task that resumes after a failure
 can rerun its lobby steps.
 
+## The match protocol: `urn:game:match/v1`
+
+Closing the lobby creates the game and its match: the game from its start to its end. The lobby says who plays, by its
+player slots and teams. The match says how it's going, by `player_id`.
+
+### Lifecycle
+
+```
+ the lobby closes ─► not_started ─► started ─► finished      by the game's rules or its limit; finish plays it out
+                                      ⇅
+                                    paused                   by the game, which resumes it
+
+ not_started, started or paused ─► cancelled                 cancel, or finish in a game that can't be played out
+                                 ─► failed                   the engine broke
+```
+
+| `status` | |
+|---|---|
+| `not_started` | The game exists, and waits for every player to be ready. |
+| `started` | Being played. |
+| `paused` | Suspended by the game, which resumes it: a realtime game whose player has lost its connection, say. Game time doesn't pass. |
+| `finished` | Ended on its own, by the game's rules or at its limit. |
+| `cancelled` | The harness ended it first. |
+| `failed` | The engine broke. |
+
+- **`finished`, `cancelled` and `failed` are final:** after one, nothing in the match changes.
+- **`status_detail` is the game's own words** beside the status: "x won", "out of time", the engine's error. Show it;
+  never parse it.
+- **Each player's `status`** is `not_ready` or `ready` before the start, `undecided` once the match starts, and `won`,
+  `lost` or `drawn` as the game's rules decide. A player the game didn't decide by the end stays `undecided`.
+
+**The start gate.** A game whose first moves must line up, such as a realtime game whose clock would otherwise run
+while its agents read their briefings, marks a `@begin_game` method. Its match starts when every player is ready.
+A player is ready by its first move, which the game reports with `player_ready`, or by the method, for a player that
+starts without moving. The game's AI starts ready. A game can also start without a silent player after a while
+(`begin_match`, its own stall rule), saying who was missing in `status_detail`. A game without `@begin_game`, like
+tic-tac-toe, has nothing to line up, and its match starts as the lobby closes.
+
+### Methods
+
+Advertised on the env's card, in the `urn:game:match/v1` extension's `params.methods`, and called with
+`client.invoke_extension(base, card, MATCH, params, method=...)`.
+
+| Method | Route | Request | Response |
+|---|---|---|---|
+| `get` | `GET /agentenv/ext/match` | | the match; `null` until the lobby closes |
+| `player_ready` | `POST /agentenv/ext/match/player_ready` | `{"player_id": ..., "lobby_id": ...}`; `lobby_id` optional | the match |
+| `finish` | `POST /agentenv/ext/match/finish` | `{"lobby_id": ...}`, optional | the match, final |
+| `cancel` | `POST /agentenv/ext/match/cancel` | `{"lobby_id": ...}`, optional | the match, final |
+
+- **`finish` plays the match out,** for a run whose agents have stopped. The game takes no more moves from agents and
+  people, and runs to the end its rules or its limit set, so every match is graded at its end. It replies once the
+  match is final: for a realtime game, up to the rest of its time limit. A match that hasn't started starts first. A
+  game that can't advance without its players (tic-tac-toe, untimed chess) has nothing to play out, and its match ends
+  `cancelled`.
+- **`cancel` ends the match where it stands.**
+- **On a final match, `finish` and `cancel` return it unchanged,** so cleanup can always cancel. `player_ready` for
+  the game's AI, or once the match has started, also returns it unchanged.
+- **Nobody but the game pauses a match yet.** `pause` and `resume` methods come when something needs them.
+
+### Types
+
+| Type | Fields |
+|---|---|
+| `Match` | `lobby_id`: the lobby it was created from; one match per lobby, so it names the match too. `status`: `MatchStatus`. `status_detail`. `progress`: `Counter`s, outermost first. `player_states`: a `PlayerState` for each of the lobby's player slots, by `player_id`. |
+| `Counter` | `name`. `unit`: free text; `seconds` (game time), `wall_seconds` and `turns` are documented. `value`: from 0. `limit`: ends this scope, and the first counter's ends the match. `rate`: units per wall-clock second while it runs on its own; `0` stopped, absent only as players act. |
+| `PlayerState` | `status`: `PlayerStatus`. `scores`: `Score`s, the first the game's main score. |
+| `Score` | `name`: the same name is the same measure on every player that has it. `value`. `better`: `higher` or `lower`. `unit`. |
+
+A Total War campaign would report `[{"name": "campaign", "unit": "turns", "value": 12, "limit": 100}, {"name":
+"battle", "unit": "seconds", "value": 340, "limit": 1200, "rate": 1.0}]` during a battle: the inner counter is there
+only while its scope is.
+
+### Errors
+
+| Code | When |
+|---|---|
+| `no_match` | the lobby hasn't closed |
+| `lobby_replaced` | a `lobby_id` that isn't the current lobby's |
+| `bad_player` | `player_ready` for a `player_id` that plays no player slot of this match |
+| `bad_request` | a body that isn't a JSON object, has unknown fields, or lacks `player_id` |
+
+If the game breaks while it starts or plays out, the method answers 500 with `match_failed`, and the match is `failed`.
+
 ## Writing a game env
 
 Subclass `AgentEnvGameEnv`. Declare the game's settings as pydantic models:
@@ -292,33 +424,53 @@ Then mark the game's parts, the way agentenv-protocol's data plane marks `@reset
 | `@player_slot_limits` | when a lobby opens | `game_settings` (its `GameSettings`), `requested` (the opener's `PlayerSlotLimits`) | the `PlayerSlotLimits` the lobby keeps | optional; without it, the request as given |
 | `@check_player_slot` | before the lobby takes a player slot | `slot`, `lobby` | nothing; raise `ValueError` to refuse | optional |
 | `@player_slot_card` | for an agent's or a person's player slot | `slot` | its `EnvironmentCard` | optional; default: one MCP interface |
+| `@player_teams` | as player slots fill | `lobby` | its `PlayerTeam`s, every player slot on exactly one | optional; default: a team per player slot |
+| `@match_report` | on every read of the match, until it's final | nothing | a `MatchReport` | optional; without it, the match has only its lifecycle |
+| `@begin_game` | once, as the match starts | nothing | nothing; a failure fails the match | optional, `async`; without it, the match starts as the lobby closes |
+| `@play_out` | by `finish` | nothing | nothing, once the game's rules or its limit have ended the match; it takes no player moves | optional, `async`; without it, `finish` cancels |
 | `@license_needs` | for the license's status, and before the lobby closes | nothing | the `LicenseItem`s the game still lacks; empty when licensed | optional, with `@install_license` |
 | `@install_license` | when parts arrive | `parts`: a `LicenseParts` | nothing; raise `ValueError` to refuse a part | with `@license_needs` |
 
 - **One method per decorator, across the class and its bases.** The method name is yours.
-- **A `ValueError` from your method is the caller's `bad_settings`,** with your message. Raise a `LobbyError` to give
-  another code: `bad_slot` for a `player_id` the game doesn't have.
+- **A `ValueError` from a lobby method is the caller's `bad_settings`,** with your message. Raise a `GameError` to
+  give another code: `bad_slot` for a `player_id` the game doesn't have.
 - **The marks are checked before the env serves.** That covers the count, `@create_game` being present and async, and
   the number of arguments. A mistake fails at `create_app()` or the first lobby call, not mid-game.
 
-In the game's own tools and extensions, **`self.player()`** is the player slot the current request plays, by its
-`/players/<player_id>` address. It's `None` at the env's own address, and a request for an id that plays no agent or
-human slot is refused.
+**The match splits in two.** The base class keeps what the protocol promises: the start gate, `cancelled`, and a
+final match never changing. The game reports what only it knows in its `@match_report`, read whenever the match is:
+
+| `MatchReport` field | |
+|---|---|
+| `status` | the game's own: `started`, `paused`, `finished` or `failed`. `failed` counts at any time, the others once the match has started. |
+| `status_detail` | its words for it |
+| `progress` | its `Counter`s |
+| `outcomes` | `won`, `lost` or `drawn`, by `player_id`, for the players its rules have decided |
+| `scores` | `Score`s, by `player_id` |
+
+In the game's own tools and extensions:
+
+- **`self.player()`** is the player slot the current request plays, by its `/players/<player_id>` address. It's
+  `None` at the env's own address, and a request for an id that plays no agent or human slot is refused.
+- **`self.match`** is how the match stands; check `self.match.status` before taking a move.
+- **`await self.player_ready(player_id)`** on a player's first move, in a game with `@begin_game`.
+- **`await self.begin_match(status_detail)`** starts the match without a silent player: the game's own stall rule.
 
 **In process,** as tests or a game's own default setup use it: `self.lobby`, `self.new_lobby(...)`,
-`self.fill_slot(SlotRequest(...))`, `await self.close_lobby()`, `self.cancel_lobby()` and `self.slot_card(player_id)`
-do what the methods do.
+`self.fill_slot(SlotRequest(...))`, `await self.close_lobby()`, `self.cancel_lobby()`, `self.slot_card(player_id)`,
+`await self.finish_match()` and `self.cancel_match()` do what the methods do.
 
-**Serving:** `serve()` or `create_app()`, as for any AgentEnv environment. `create_app()` adds the lobby's routes, the
-player slots' cards and the routing (the SDK serves one handler per extension, so the lobby's other methods are added
-there). `mount()` onto an app of your own isn't supported.
+**Serving:** `serve()` or `create_app()`, as for any AgentEnv environment. `create_app()` adds the routes of the
+lobby, the match and the license, the player slots' cards and the routing. Each protocol has several methods and the
+SDK serves one handler per extension, so the three are declared on the game's card and served by these routes.
+`mount()` onto an app of your own isn't supported.
 
 ## The task steps
 
 **`add_license`** gives a licensed game its license: [Licenses](#the-add_license-step). Put it before
-`start_match`.
+`close_lobby`.
 
-**`create_match`** opens the lobby for a match:
+**`open_lobby`** opens the lobby for a match:
 
 | Field | |
 |---|---|
@@ -355,9 +507,16 @@ there). `mount()` onto an app of your own isn't supported.
 - **Every player slot is kept in the run's `metadata["game_slots"]`,** by `player_id`: its `interfaces` with full URLs,
   and for an agent the addresses `registered` with it.
 
-**`start_match`** closes the lobby, which creates the game. It takes `env_id` and `timeout_seconds` (default `900`).
-Put it after every `add_player_slot` of the game and before its players play. The closed lobby is kept in
-`metadata["game_lobby"]`.
+**`close_lobby`** closes the lobby, which creates the game and its match. It takes `env_id` and `timeout_seconds`
+(default `900`). Put it after every `add_player_slot` of the game and before its players play. The closed lobby is
+kept in `metadata["game_lobby"]`.
+
+**`finish_match`** plays the match out once its agents have stopped: put it after every `prompt_agent` of the match
+and before its grading. A game that can't be played out ends its match `cancelled`, and a match already over is left
+as it is. It takes `env_id` and `timeout_seconds` (default `7200`, for a realtime game's remaining time). The final
+match is kept in `metadata["game_match"]`.
+
+**`cancel_match`** ends the match where it stands, likewise (`timeout_seconds` default `60`).
 
 ## Licenses: `urn:game:license/v1`
 
@@ -420,7 +579,8 @@ def install(self, parts: LicenseParts) -> None:   # parts.files: bytes, parts.ke
 | `get` | `GET /agentenv/ext/license` | | `{"missing": [<LicenseItem>...], "installed": [<names>]}` |
 | `add` | `POST /agentenv/ext/license/add` | `{"files": {name: base64}, "keys": {name: text}, "accept": [names]}` | the same status |
 
-A part the game refuses is `bad_license`, with the reason. A key is never part of a reply, not even in an error.
+A part the game refuses is `bad_license`, with the reason, and a game that breaks installing one answers 500 with
+`license_failed`. A key is never part of a reply, not even in an error.
 
 ### The `add_license` step
 
@@ -464,16 +624,16 @@ What the step does:
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest          # the lobby in process, served over HTTP, players over MCP, and the steps with a fake agent
+.venv/bin/pytest          # the lobby and the match in process, served over HTTP, players over MCP, the steps with a fake agent
 .venv/bin/ruff check .
 ```
 
 ## Not done yet
 
-- **The match,** `urn:game:match/v1`: what happens after the lobby closes, such as the start gate, holds, finishing,
-  and each player's result and scores. It's being designed; Warcraft III has its own version in
+- **Warcraft III moves onto the match protocol next.** Its own version is in
   [agentenv-wc3-plugin](https://github.com/earakely-scale/agentenv-wc3-plugin)'s `agentenv_rts`.
-- **Nothing calls `cancel` yet.** Its natural caller is cleanup for a run that ends before `start_match`.
+- **Nothing calls the lobby's `cancel` yet.** Its natural caller is cleanup for a run that ends before `close_lobby`.
+- **The harness can't pause a match.** Only a game pauses its own.
 - **A player slot's address isn't a secret.** Any client that can reach the env can use another player's path. A
   per-slot token in its `headers` would close that.
 

@@ -1,5 +1,6 @@
 """Tic-tac-toe as a game env: two players, x and o, each an agent or the game's AI, put their marks on a 3x3 board in
-turn. A player slot's id is its mark.
+turn. A player slot's id is its mark. Its match starts as the lobby closes, since a turn game has nothing to line up,
+and it can't be played out without its players, so finishing it early cancels it.
 
     python examples/tictactoe.py      # serves it on port 18765 (MCP_PORT); each player plays at /players/<x|o>/mcp
 """
@@ -13,13 +14,17 @@ from pydantic import BaseModel, ConfigDict
 
 from agentenv_game import (
     AgentEnvGameEnv,
+    Counter,
+    GameError,
     Lobby,
-    LobbyError,
+    MatchReport,
+    MatchStatus,
     PlayerKind,
     PlayerSlot,
     PlayerSlotLimits,
     check_player_slot,
     create_game,
+    match_report,
     player_slot_limits,
 )
 
@@ -49,13 +54,23 @@ class TicTacToe(AgentEnvGameEnv):
     @check_player_slot
     def a_mark(self, slot: PlayerSlot, lobby: Lobby) -> None:
         if slot.player_id not in MARKS:
-            raise LobbyError("bad_slot", f'tic-tac-toe\'s player slots are "x" and "o", not {slot.player_id!r}')
+            raise GameError("bad_slot", f'tic-tac-toe\'s player slots are "x" and "o", not {slot.player_id!r}')
 
     @create_game
     async def new_game(self, lobby: Lobby) -> None:
         self.players = {s.player_id: s for s in lobby.player_slots}
         self.board, self.turn, self.winner = [" "] * 9, lobby.game_settings["first"], None
         self._ai_moves()
+
+    @match_report
+    def report(self) -> MatchReport:
+        over = self.winner is not None
+        return MatchReport(
+            status="finished" if over else "started",
+            status_detail=(f"{self.winner} won" if self.winner in MARKS else "a draw") if over else None,
+            progress=[Counter(name="game", unit="moves", value=9 - self.board.count(" "), limit=9)],
+            outcomes={m: "drawn" if self.winner == "draw" else "won" if m == self.winner else "lost"
+                      for m in MARKS} if over else {})
 
     # ---- the game: what each player can do ----
 
@@ -67,18 +82,18 @@ class TicTacToe(AgentEnvGameEnv):
     @tool()
     async def mark(self, cell: int):
         """Put your mark in a free cell on your turn: 0 to 8, top left to bottom right."""
-        mine = self._mine()
-        if self.winner is None and mine == self.turn and 0 <= cell <= 8 and self.board[cell] == " ":
+        mine, status = self._mine(), self.match.status
+        if status is MatchStatus.STARTED and mine == self.turn and 0 <= cell <= 8 and self.board[cell] == " ":
             self._put(cell)
             self._ai_moves()
             return self._show()
-        why = ("the game is over" if self.winner else f"it is {self.turn}'s turn" if mine != self.turn
-               else f"cell {cell} is not free")
+        why = (f"the match is {status}" if status is not MatchStatus.STARTED else f"it is {self.turn}'s turn"
+               if mine != self.turn else f"cell {cell} is not free")
         return f"Not marked: {why}.\n{self._show()}"
 
     def _mine(self) -> str:
-        if not self.board:
-            raise ValueError("the game has not started: its lobby is still open")
+        if self.match is None:
+            raise ValueError("there is no game yet: its lobby hasn't closed")
         slot = self.player()
         if slot is None:
             raise ValueError("play at your player slot's address, /players/<x|o>/mcp")

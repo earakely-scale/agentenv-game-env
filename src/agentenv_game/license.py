@@ -13,7 +13,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .lobby import NAME, LobbyError
+from .lobby import NAME, GameError
 
 LICENSE = "urn:game:license/v1"
 
@@ -60,31 +60,31 @@ class LicenseParts(BaseModel):
 def parts_for(missing: list[LicenseItem], files: dict, keys: dict, accept: list) -> LicenseParts:
     """The parts an `add` call gives, each checked against the item it fills: the game asked for it, as that kind,
     and it fits the item's limits. A part for an item the game doesn't lack now is refused too, so nothing is sent
-    by mistake. Raises LobbyError("bad_license")."""
+    by mistake. Raises GameError("bad_license")."""
     wanted = {i.name: i for i in missing}
     given = [*(("file", n) for n in files), *(("key", n) for n in keys), *(("acceptance", n) for n in accept)]
     for kind, name in given:
         item = wanted.get(name)
         if item is None:
-            raise LobbyError("bad_license", f"the game doesn't need {kind} {name} now; it lacks "
+            raise GameError("bad_license", f"the game doesn't need {kind} {name} now; it lacks "
                                             f"{', '.join(i.label() for i in missing) or 'nothing'}")
         if item.kind.value != kind:
-            raise LobbyError("bad_license", f"{name} is a {item.kind.value}, not a {kind}")
+            raise GameError("bad_license", f"{name} is a {item.kind.value}, not a {kind}")
     decoded = {}
     for name, value in files.items():
         try:
             data = base64.b64decode(value, validate=True) if isinstance(value, str) else b""
         except binascii.Error as e:
-            raise LobbyError("bad_license", f"file {name} is not base64 ({e})") from e
+            raise GameError("bad_license", f"file {name} is not base64 ({e})") from e
         if not data:
-            raise LobbyError("bad_license", f"file {name} is empty")
+            raise GameError("bad_license", f"file {name} is empty")
         if wanted[name].max_bytes is not None and len(data) > wanted[name].max_bytes:
-            raise LobbyError("bad_license", f"file {name} is {len(data)} bytes, more than the "
+            raise GameError("bad_license", f"file {name} is {len(data)} bytes, more than the "
                                             f"{wanted[name].max_bytes} it can be")
         decoded[name] = data
     for name, value in keys.items():
         if not isinstance(value, str) or not value:
-            raise LobbyError("bad_license", f"key {name} is empty")
+            raise GameError("bad_license", f"key {name} is empty")
         if wanted[name].pattern is not None and not re.fullmatch(wanted[name].pattern, value):
-            raise LobbyError("bad_license", f"key {name} is not in its format ({wanted[name].pattern})")
+            raise GameError("bad_license", f"key {name} is not in its format ({wanted[name].pattern})")
     return LicenseParts(files=decoded, keys=dict(keys), accepted=list(accept))
