@@ -1,0 +1,51 @@
+:root {
+  --accent: #e8b04a;
+  --font: "Noto Sans", "DejaVu Sans", sans-serif;
+  --panel: rgba(12, 15, 20, .86);
+  --ink: #f2f4f7;
+  --dim: #9aa4b2;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+[hidden] { display: none !important; }
+
+/* the 1920x1080 frame, scaled to the window */
+#stage { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; transform-origin: 0 0;
+  font-family: var(--font); color: var(--ink); }
+#view { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+#slate { position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
+  background: radial-gradient(circle at 50% 40%, #1d2530, #07090c); }
+#slate h1 { font-size: 72px; margin: 0 0 16px; }
+#slate p { font-size: 32px; color: var(--dim); margin: 0; }
+.widget { position: absolute; }
+
+/* the score bug: each team's players and main score, the clock or the result between */
+.score_bug { display: flex; align-items: stretch; background: var(--panel); border-radius: 10px;
+  border-bottom: 4px solid var(--accent); font-size: 28px; overflow: hidden; box-shadow: 0 6px 24px rgba(0, 0, 0, .45);
+  white-space: nowrap; }
+.score_bug .team { display: flex; gap: 22px; padding: 12px 24px; align-items: center; }
+.score_bug .mid { padding: 12px 22px; background: rgba(255, 255, 255, .07); color: var(--dim);
+  font-variant-numeric: tabular-nums; display: flex; align-items: center; }
+.score_bug .player b { color: var(--accent); margin-left: 8px; font-variant-numeric: tabular-nums; }
+.score_bug .player.won { color: var(--accent); }
+.score_bug .player.lost { opacity: .55; }
+
+/* the sponsor banners, one at a time */
+.banners { width: 560px; height: 64px; display: flex; align-items: center; justify-content: center; padding: 0 18px;
+  background: var(--panel); border-radius: 10px; font-size: 22px; white-space: nowrap; overflow: hidden; }
+.banners.light { background: #f5f6f8; color: #14161b; }
+.banners img { height: 1.5em; vertical-align: middle; margin: -.2em .15em 0; border-radius: 4px; }
+
+/* the title card before the match starts, the end card once it is over */
+.title_card, .end_card { min-width: 880px; padding: 44px 64px; background: var(--panel); border-radius: 16px;
+  border-top: 6px solid var(--accent); text-align: center; box-shadow: 0 12px 48px rgba(0, 0, 0, .5); }
+.title_card h1, .end_card h1 { font-size: 60px; margin: 0 0 18px; }
+.title_card .sides { font-size: 40px; display: flex; gap: 28px; justify-content: center; align-items: center; }
+.title_card .vs { color: var(--accent); font-size: 28px; text-transform: uppercase; }
+.title_card p { color: var(--dim); font-size: 28px; margin: 18px 0 0; }
+.end_card table { margin: 24px auto 0; font-size: 32px; border-collapse: collapse; }
+.end_card td { padding: 6px 22px; }
+.end_card tr.won td:first-child { color: var(--accent); }
+.end_card td:nth-child(2) { color: var(--dim); }
+
+iframe.page { border: 0; background: transparent; }

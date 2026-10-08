@@ -6,11 +6,13 @@ cancel_match steps (steps.py) end it."""
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 MATCH = "urn:game:match/v1"
+FILE_NAME = r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$"
 
 
 class MatchStatus(StrEnum):
@@ -82,6 +84,9 @@ class Match(_Model):
     progress: list[Counter] = []
     player_states: dict[str, PlayerState] = {}
     """By player_id, one for each of the lobby's player slots."""
+    spectator_url: str | None = None
+    """Where the match's spectator view is, relative to the env, its own env card at
+    `<spectator_url>/.well-known/agent-env.json`; None for a game without one."""
 
 
 class MatchReport(_Model):
@@ -95,3 +100,20 @@ class MatchReport(_Model):
     """By player_id, those the rules have decided."""
     scores: dict[str, list[Score]] = {}
     """By player_id."""
+
+
+class MatchFile(_Model):
+    """A file a game keeps of its finished match, as its `@match_files` gives it: a replay, a video, a timeline. `kind`
+    is the game's own name for what it is; `file` is where it is on disk, which the SDK serves and never sends."""
+
+    name: str = Field(pattern=FILE_NAME)
+    kind: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    content_type: str = "application/octet-stream"
+    file: Path = Field(exclude=True)
+
+
+class MatchFiles(_Model):
+    """What `@match_files` returns when it has something to say beside the files: why one is missing, say."""
+
+    files: list[MatchFile] = []
+    notes: list[str] = []

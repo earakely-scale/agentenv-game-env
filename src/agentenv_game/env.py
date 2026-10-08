@@ -3,8 +3,9 @@
 card, and tells each request which player slot it plays. A game declares its settings as pydantic models,
 `GameSettings` for the lobby's and `PlayerSlotSettings` for each player slot's, and marks its parts with decorators,
 as agentenv-protocol's data plane marks `@reset_data`: `@create_game` (required), `@player_slot_limits`,
-`@check_player_slot`, `@player_slot_card` and `@player_teams` for the lobby; `@match_report`, `@begin_game` and
-`@play_out` for the match; and for a licensed game `@license_needs` with `@install_license`."""
+`@check_player_slot`, `@player_slot_card` and `@player_teams` for the lobby; `@match_report`, `@begin_game`,
+`@play_out`, `@spectator_card` and `@match_files` for the match; and for a licensed game `@license_needs` with
+`@install_license`."""
 
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ from agentenv_protocol.types import (
 )
 from pydantic import BaseModel, ValidationError
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 
 from .license import LICENSE, LicenseItem, parts_for
 from .lobby import (
@@ -43,14 +44,15 @@ from .lobby import (
     PlayerTeam,
     SlotRequest,
 )
-from .match import FINAL, MATCH, Match, MatchReport, MatchStatus, PlayerState, PlayerStatus
-from .routing import PLAYERS, PlayerPaths, current_player
+from .match import FINAL, MATCH, Match, MatchFile, MatchFiles, MatchReport, MatchStatus, PlayerState, PlayerStatus
+from .routing import PLAYERS, SPECTATORS, PlayerPaths, current_player, current_spectator
 
 log = logging.getLogger(__name__)
 _HOOK = "_agentenv_game_hook"
 HOOKS = {"player_slot_limits": (2, False), "check_player_slot": (2, False), "create_game": (1, True),
          "player_slot_card": (1, False), "player_teams": (1, False), "match_report": (0, False),
-         "begin_game": (0, True), "play_out": (0, True), "license_needs": (0, False), "install_license": (1, False)}
+         "begin_game": (0, True), "play_out": (0, True), "spectator_card": (0, False), "match_files": (1, True),
+         "license_needs": (0, False), "install_license": (1, False)}
 """Each decorator's method: its parameters after self, and whether it is a coroutine."""
 
 LOBBY_ID = {"type": "object", "additionalProperties": False, "properties": {"lobby_id": {"type": "string"}}}
@@ -87,14 +89,18 @@ def lobby_params(game_settings: type[BaseModel] | None, slot_settings: type[Base
 MATCH_ROUTE = f"{RPC_PATH}/ext/match"
 MATCH_DESCRIPTION = ("The game the lobby's close created, from its start to its end: get how it stands (null until "
                      "the lobby closes), say a player is ready (it starts once every player is), finish it by playing "
-                     "it out with no more player moves, or cancel it where it stands.")
+                     "it out with no more player moves, cancel it where it stands, and, once it is over, list the "
+                     "files the game keeps of it (each downloaded from its path).")
 MATCH_PARAMS = {"endpoint": MATCH_ROUTE, "methods": {
     "get": {"method": "GET", "endpoint": MATCH_ROUTE},
     "player_ready": {"method": "POST", "endpoint": f"{MATCH_ROUTE}/player_ready", "request": {
         **LOBBY_ID, "required": ["player_id"],
         "properties": {**LOBBY_ID["properties"], "player_id": {"type": "string"}}}},
     "finish": {"method": "POST", "endpoint": f"{MATCH_ROUTE}/finish", "request": LOBBY_ID},
-    "cancel": {"method": "POST", "endpoint": f"{MATCH_ROUTE}/cancel", "request": LOBBY_ID}}}
+    "cancel": {"method": "POST", "endpoint": f"{MATCH_ROUTE}/cancel", "request": LOBBY_ID},
+    "files": {"method": "POST", "endpoint": f"{MATCH_ROUTE}/files", "request": {
+        **LOBBY_ID,
+        "properties": {**LOBBY_ID["properties"], "kinds": {"type": "array", "items": {"type": "string"}}}}}}}
 
 LICENSE_ROUTE = f"{RPC_PATH}/ext/license"
 LICENSE_DESCRIPTION = ("What the game needs from its user to run (license files, keys, terms to accept) and still "
@@ -171,6 +177,21 @@ def play_out(fn: Callable) -> Callable:
     return _mark(fn, "play_out")
 
 
+def spectator_card(fn: Callable) -> Callable:
+    """The method that gives the match's spectator view its env card, `()`: the env as an onlooker sees it, served at
+    the match's spectator_url (`/spectators`), with the game's page as an `http` interface that draws only the game,
+    full-frame, for a broadcast's overlay to frame. Requests under it are a spectator's (`spectating()`). Without it,
+    the game has no spectator view."""
+    return _mark(fn, "spectator_card")
+
+
+def match_files(fn: Callable) -> Callable:
+    """The coroutine that gives a finished match's files, `(kinds)`: the kinds asked for, or None for the game's
+    default ones, as MatchFiles (or a list of MatchFile: a name, the game's kind, a content type, the file on disk).
+    The SDK serves each at its path. It is called only once the match is over; a ValueError refuses the kinds."""
+    return _mark(fn, "match_files")
+
+
 def license_needs(fn: Callable) -> Callable:
     """The method that says what the game still lacks to run, `()`, as LicenseItems: files, keys and acceptances.
     An empty list means it is licensed; a lobby doesn't close until it is. A game with it has `@install_license`."""
@@ -217,6 +238,8 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
     _lobby: Lobby | None = None
     _match: Match | None = None
     """The match's lifecycle, kept here; once final, the match as it ended."""
+    _files: dict[str, MatchFile] | None = None
+    """The files the last `files` listed, by name, served until the next lobby opens."""
     _closing: asyncio.Lock | None = None
     _beginning: asyncio.Lock | None = None
     _finishing: asyncio.Lock | None = None
@@ -304,7 +327,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
                 raise GameError("bad_settings", str(e)) from e
         self._lobby = Lobby(lobby_id=f"lb-{secrets.token_hex(4)}", status=LobbyStatus.OPEN,
                             game_settings=_dump(settings), player_slot_limits=limits)
-        self._match = None
+        self._match = self._files = None
         return self._lobby
 
     def fill_slot(self, request: SlotRequest) -> PlayerSlot:
@@ -357,9 +380,11 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
                                                 "add_license step gives a game its license")
             try:
                 await self._hooks()["create_game"](lobby)
-                self._match = Match(lobby_id=lobby.lobby_id, player_states={s.player_id: PlayerState(
-                    status=PlayerStatus.READY if s.player_kind is PlayerKind.AI else PlayerStatus.NOT_READY)
-                    for s in lobby.player_slots})
+                self._match = Match(
+                    lobby_id=lobby.lobby_id, spectator_url=SPECTATORS if "spectator_card" in self._hooks() else None,
+                    player_states={s.player_id: PlayerState(
+                        status=PlayerStatus.READY if s.player_kind is PlayerKind.AI else PlayerStatus.NOT_READY)
+                        for s in lobby.player_slots})
                 if "begin_game" not in self._hooks() or all(s.player_kind is PlayerKind.AI
                                                             for s in lobby.player_slots):
                     await self._begin()
@@ -444,7 +469,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
             players[player_id] = PlayerState(status=now, scores=report.scores.get(player_id))
         return Match(lobby_id=match.lobby_id, status=status,
                      status_detail=detail or report.status_detail or match.status_detail,
-                     progress=report.progress, player_states=players)
+                     progress=report.progress, player_states=players, spectator_url=match.spectator_url)
 
     def _end(self, status: MatchStatus, detail: str | None = None) -> Match:
         self._match = self._merged(self._match, self._report(), status, detail)
@@ -530,6 +555,40 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
         match = self.match
         return match if match.status in FINAL else self._end(MatchStatus.CANCELLED)
 
+    async def list_match_files(self, kinds: list[str] | None = None, lobby_id: str | None = None) -> dict:
+        """The files the game keeps of its finished match (its `@match_files`), `kinds` of them or its default ones,
+        each served at its path until the next lobby opens. Refused before the match is over."""
+        self._current(lobby_id)
+        if (status := self.match.status) not in FINAL:
+            raise GameError("match_not_final", f"a match's files are kept once it is over, and it is {status}")
+        hook = self._hooks().get("match_files")
+        if hook is None:
+            return {"files": [], "notes": [f"{super()._build_card().name} keeps no files of its matches"]}
+        try:
+            given = await hook(kinds)
+        except ValueError as e:
+            raise GameError("bad_request", str(e)) from e
+        found = given if isinstance(given, MatchFiles) else MatchFiles(files=given)
+        self._files = {f.name: f for f in found.files}
+        return {"files": [{**f.model_dump(mode="json"), "bytes": f.file.stat().st_size,
+                           "path": f"{MATCH_ROUTE}/files/{f.name}"} for f in found.files], "notes": found.notes}
+
+    # ---- the spectator view ----
+
+    def spectators_card(self) -> dict | None:
+        """The spectator view's env card, the env as an onlooker sees it (its `@spectator_card`); None for a game
+        without one, or before its lobby closes."""
+        hook = self._hooks().get("spectator_card")
+        if hook is None or self._match is None:
+            return None
+        card = hook()
+        card = card if isinstance(card, EnvironmentCard) else EnvironmentCard(**card)
+        return card.model_dump(mode="json", exclude_none=True)
+
+    def spectating(self) -> bool:
+        """Whether the current request is a spectator's, under the spectator view's `/spectators`."""
+        return current_spectator()
+
     # ---- the license ----
 
     def license_missing(self) -> list[LicenseItem]:
@@ -605,6 +664,23 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
         match = self.cancel_match(_strings(params, "cancel", "lobby_id").get("lobby_id"))
         return match.model_dump(mode="json", exclude_none=True)
 
+    async def _match_files(self, params: dict) -> dict:
+        if unknown := sorted(set(params) - {"lobby_id", "kinds"}):
+            raise GameError("bad_request", f"files takes lobby_id and kinds, not {unknown}")
+        kinds = params.get("kinds")
+        if kinds is not None and not (isinstance(kinds, list) and all(isinstance(k, str) for k in kinds)):
+            raise GameError("bad_request", "kinds is a list of the game's kinds of file")
+        return await self.list_match_files(kinds, _strings({k: v for k, v in params.items() if k != "kinds"},
+                                                           "files", "lobby_id").get("lobby_id"))
+
+    async def _match_file(self, request: Request):
+        name = request.path_params["name"]
+        found = (self._files or {}).get(name)
+        if found is None or not found.file.is_file():
+            return JSONResponse(error_body("unknown_file", f"no file {name!r} of this match: files lists them"),
+                                status_code=404)
+        return FileResponse(found.file, media_type=found.content_type, filename=found.name)
+
     async def _license_get(self, params: dict) -> dict:
         return self.license_status()
 
@@ -641,11 +717,13 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
                 (ROUTE, "lobby_failed", {"": self._lobby_get, "open": self._open, "fill": self._fill,
                                          "close": self._close, "cancel": self._cancel}),
                 (MATCH_ROUTE, "match_failed", {"": self._match_get, "player_ready": self._player_ready,
-                                               "finish": self._finish, "cancel": self._cancel_match}),
+                                               "finish": self._finish, "cancel": self._cancel_match,
+                                               "files": self._match_files}),
                 (LICENSE_ROUTE, "license_failed", {"": self._license_get, "add": self._add_license})):
             for method, call in methods.items():
                 app.custom_route(f"{route}/{method}" if method else route, methods=["POST" if method else "GET"])(
                     self._route(call, failed))
+        app.custom_route(f"{MATCH_ROUTE}/files/{{name}}", methods=["GET"])(self._match_file)
         routes = app.streamable_http_app
-        app.streamable_http_app = lambda: PlayerPaths(routes(), card=self.slot_card)
+        app.streamable_http_app = lambda: PlayerPaths(routes(), card=self.slot_card, spectators=self.spectators_card)
         return app

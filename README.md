@@ -11,11 +11,16 @@ package gives every game env one way to say who plays it and how it is going:
   progress and each player's outcome and scores.
 - **`AgentEnvGameEnv`**, the base class that serves them and tells each request which player slot it plays. A game
   declares its settings as pydantic models and marks its own parts of the lobby and the match with decorators.
+- **A spectator view and match files**: the env as an onlooker sees it, the game alone on screen, and the files the
+  game keeps of a finished match (its replay, its recording), which the match's `files` method lists.
 - **A license**, `urn:game:license/v1`, for a game that needs something from its user to run (license files, keys,
   terms to accept), which must never be in its image, a task file or a reply.
-- **Six task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
-  `add_player_slot` and `close_lobby` open, fill and close the lobby of any game env built on it; and `finish_match`
-  and `cancel_match` end its match.
+- **A broadcast** of a match to Twitch or X, or only recorded: the game's spectator view under an overlay of the
+  players, the clock and the score, which reads only the lobby and the match, so it is the same for every game.
+- **Nine task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
+  `add_player_slot` and `close_lobby` open, fill and close the lobby of any game env built on it; `finish_match`
+  and `cancel_match` end its match, and `save_match_files` keeps its files; `start_broadcast` and `save_broadcast`
+  broadcast it and keep the video.
 
 The same task steps then put players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent. Warcraft III's env, in
@@ -367,6 +372,7 @@ Advertised on the env's card, in the `urn:game:match/v1` extension's `params.met
 | `player_ready` | `POST /agentenv/ext/match/player_ready` | `{"player_id": ..., "lobby_id": ...}`; `lobby_id` optional | the match |
 | `finish` | `POST /agentenv/ext/match/finish` | `{"lobby_id": ...}`, optional | the match, final |
 | `cancel` | `POST /agentenv/ext/match/cancel` | `{"lobby_id": ...}`, optional | the match, final |
+| `files` | `POST /agentenv/ext/match/files` | `{"lobby_id": ..., "kinds": [...]}`, both optional | `{"files": [...], "notes": [...]}`: the files the game keeps of the final match |
 
 - **`finish` plays the match out,** for a run whose agents have stopped. The game takes no more moves from agents and
   people, and runs to the end its rules or its limit set, so every match is graded at its end. It replies once the
@@ -377,12 +383,15 @@ Advertised on the env's card, in the `urn:game:match/v1` extension's `params.met
 - **On a final match, `finish` and `cancel` return it unchanged,** so cleanup can always cancel. `player_ready` for
   the game's AI, or once the match has started, also returns it unchanged.
 - **Nobody but the game pauses a match yet.** `pause` and `resume` methods come when something needs them.
+- **`files` lists what the game keeps of a final match** (its `@match_files`): `kinds` picks among them, else the game's
+  default ones. Each is `{"name", "kind", "content_type", "bytes", "path"}`, and `GET <path>` streams it until the next
+  lobby opens. A game that keeps none answers no files and says so in `notes`.
 
 ### Types
 
 | Type | Fields |
 |---|---|
-| `Match` | `lobby_id`: the lobby it was created from; one match per lobby, so it names the match too. `status`: `MatchStatus`. `status_detail`. `progress`: `Counter`s, outermost first. `player_states`: a `PlayerState` for each of the lobby's player slots, by `player_id`. |
+| `Match` | `lobby_id`: the lobby it was created from; one match per lobby, so it names the match too. `status`: `MatchStatus`. `status_detail`. `progress`: `Counter`s, outermost first. `player_states`: a `PlayerState` for each of the lobby's player slots, by `player_id`. `spectator_url`: `/spectators`, where its spectator view's env card is, for a game that has one. |
 | `Counter` | `name`. `unit`: free text; `seconds` (game time), `wall_seconds` and `turns` are documented. `value`: from 0. `limit`: ends this scope, and the first counter's ends the match. `rate`: units per wall-clock second while it runs on its own; `0` stopped, absent only as players act. |
 | `PlayerState` | `status`: `PlayerStatus`. `scores`: `Score`s, the first the game's main score. |
 | `Score` | `name`: the same name is the same measure on every player that has it. `value`. `better`: `higher` or `lower`. `unit`. |
@@ -398,7 +407,9 @@ only while its scope is.
 | `no_match` | the lobby hasn't closed |
 | `lobby_replaced` | a `lobby_id` that isn't the current lobby's |
 | `bad_player` | `player_ready` for a `player_id` that plays no player slot of this match |
-| `bad_request` | a body that isn't a JSON object, has unknown fields, or lacks `player_id` |
+| `bad_request` | a body that isn't a JSON object, has unknown fields, or lacks `player_id`; `kinds` the game doesn't keep |
+| `match_not_final` | `files` before the match is over |
+| `unknown_file` | (404) a file's path that the last `files` didn't list |
 
 If the game breaks while it starts or plays out, the method answers 500 with `match_failed`, and the match is `failed`.
 
@@ -428,6 +439,8 @@ Then mark the game's parts, the way agentenv-protocol's data plane marks `@reset
 | `@match_report` | on every read of the match, until it's final | nothing | a `MatchReport` | optional; without it, the match has only its lifecycle |
 | `@begin_game` | once, as the match starts | nothing | nothing; a failure fails the match | optional, `async`; without it, the match starts as the lobby closes |
 | `@play_out` | by `finish` | nothing | nothing, once the game's rules or its limit have ended the match; it takes no player moves | optional, `async`; without it, `finish` cancels |
+| `@spectator_card` | for the spectator view, once the lobby has closed | nothing | its `EnvironmentCard`, whose `http` interface is the page that shows the game alone | optional; without it, there is nothing to broadcast |
+| `@match_files` | by `files`, once the match is final | `kinds`: the kinds asked for, or `None` | `MatchFile`s (or a `MatchFiles` with `notes`); raise `ValueError` for kinds it doesn't keep | optional, `async` |
 | `@license_needs` | for the license's status, and before the lobby closes | nothing | the `LicenseItem`s the game still lacks; empty when licensed | optional, with `@install_license` |
 | `@install_license` | when parts arrive | `parts`: a `LicenseParts` | nothing; raise `ValueError` to refuse a part | with `@license_needs` |
 
@@ -455,10 +468,12 @@ In the game's own tools and extensions:
 - **`self.match`** is how the match stands; check `self.match.status` before taking a move.
 - **`await self.player_ready(player_id)`** on a player's first move, in a game with `@begin_game`.
 - **`await self.begin_match(status_detail)`** starts the match without a silent player: the game's own stall rule.
+- **`self.spectating()`** says the request came through the spectator view, under `/spectators`: its pages and their
+  requests are the game's own routes, so one page can serve players and spectators and show each what is theirs.
 
 **In process,** as tests or a game's own default setup use it: `self.lobby`, `self.new_lobby(...)`,
 `self.fill_slot(SlotRequest(...))`, `await self.close_lobby()`, `self.cancel_lobby()`, `self.slot_card(player_id)`,
-`await self.finish_match()` and `self.cancel_match()` do what the methods do.
+`await self.finish_match()`, `self.cancel_match()` and `await self.list_match_files(kinds)` do what the methods do.
 
 **Serving:** `serve()` or `create_app()`, as for any AgentEnv environment. `create_app()` adds the routes of the
 lobby, the match and the license, the player slots' cards and the routing. Each protocol has several methods and the
@@ -517,6 +532,73 @@ as it is. It takes `env_id` and `timeout_seconds` (default `7200`, for a realtim
 match is kept in `metadata["game_match"]`.
 
 **`cancel_match`** ends the match where it stands, likewise (`timeout_seconds` default `60`).
+
+**`save_match_files`** keeps the files the game keeps of its finished match: put it after `finish_match`. It takes
+`env_id`, `kinds` (default: the game's default ones) and `timeout_seconds` (default `3600`). Each file is streamed
+from the env, through a temporary file, into a `file` artifact named `<instance id>-<file name>`, and listed in
+`metadata["match_files"]` by the step's id. What the game says it couldn't keep is logged. It doesn't fail the task
+unless `fail_task_on_error` says so.
+
+## Broadcasting a match
+
+`start_broadcast` streams a match to Twitch or X, or only records it, and `save_broadcast` keeps the video. The stream
+is the game's spectator view, full-frame, under an overlay drawn from the lobby (who plays, the teams), the match (its
+status, its first counter as the clock, outcomes, main scores) and the task's presentation. Neither step knows the
+game: they read the match protocol only, so any game env with a `@spectator_card` can be broadcast.
+
+```json
+[
+  {"id": "broadcast", "type": "start_broadcast", "env_id": "tictactoe", "depends_on": ["close"],
+   "to": ["twitch"], "title": "Ada vs the house", "names": {"x": "Ada"}},
+  {"id": "play", "type": "prompt_agent", "agent_name": "alice", "depends_on": ["broadcast"], "prompt": "..."},
+  {"id": "finish", "type": "finish_match", "env_id": "tictactoe", "depends_on": ["play"]},
+  {"id": "save", "type": "save_broadcast", "env_id": "tictactoe", "depends_on": ["finish"]}
+]
+```
+
+**`start_broadcast`** returns once the stream is live, so the players' first moves are on air: put it after
+`close_lobby`, and the `prompt_agent` steps after it.
+
+| Field | |
+|---|---|
+| `to` | `twitch`, `x`, or both; empty (the default) only records |
+| `key_secrets` | the secrets holding the stream keys, from agent-env's secret store, else the environment: `{"twitch": "TWITCH_STREAM_KEY", "x_server": "X_STREAM_SERVER", "x": "X_STREAM_KEY"}` by default |
+| `record` | default `true`: also record the stream, for `save_broadcast` to keep |
+| `title` | shown on the title and end cards and the slate before the game's view loads |
+| `names` | a player slot's display name, by `player_id`; default its `label` setting, its `player_name`, or "AI" |
+| `theme` | `{"accent": "#e8b04a", "font": "Noto Sans"}` |
+| `banners` | up to 8 sponsor banners, shown in turn for 30 s each: `{"text": "Brought to you by {acme}", "logos": {"acme": "https://..."}, "theme": "dark"}`; each `{name}` in the text is a logo, an `https://` URL, an image file or a `data:` URI, inlined before the stream starts |
+| `overlay` | the widgets, in order; default the score bug alone, with the banners when there are some |
+| `size`, `fps`, `bitrate` | default `1920x1080`, `30`, `4500k` |
+| `linger_seconds` | how long the end stays on air once the match is over, default `60` |
+| `test` | Twitch's bandwidth test: streamed, never shown |
+
+The overlay's widgets sit at an anchor (`at`: `top`, `top-left`, `top-right`, `bottom`, `bottom-left`,
+`bottom-right`, `left`, `right`, `center`) or in a `box`, `[x, y, width, height]` of the 1920x1080 frame:
+
+| Widget | Shows | Default place |
+|---|---|---|
+| `score_bug` | each team's players with their main scores, and between them the clock, the pause or the result | `top` |
+| `banners` | the sponsor banners | `bottom-right` |
+| `title_card` | the title and who plays whom, until the match starts | `center` |
+| `end_card` | the result and each player's outcome and score, once the match is over | `center` |
+| `page` | any page: `"url": "env:/path"` for one the game serves, or `https://...`; `size` `[w, h]` at an anchor. It is sent `{type: "agentenv-broadcast", lobby, match, broadcast}` by `postMessage` every second | |
+
+**The streamer** is one Docker image, `agentenv-game-streamer`, built from `agentenv_game/broadcast/streamer` the first
+time (a few minutes; about 1.5 GB) and tagged with a digest of its files. Chromium shows the overlay on a virtual
+display and plays the page's sound into PulseAudio; ffmpeg encodes both once, for every destination and the recording.
+The overlay's server reads the env's card, lobby and match, so the page reads one origin. The stream keys reach the
+container in its environment only, and nothing it prints shows them. It ends `linger_seconds` after the match is over
+(or replaced by a new lobby's), or a minute after the env stops answering, so a run that stops early leaves no stream
+up. It runs where agent-env runs, beside an env in a `local` sandbox.
+
+**`save_broadcast`** keeps the video: put it after `finish_match`. It waits for the streamer `broadcast` (the
+`start_broadcast` step's id, default `"broadcast"`) to end, and stops it if the match's clock stands still for
+`stall_seconds` (default `900`) or the match has been over a while. The MP4 (or, from a streamer that died, the
+Matroska file it was writing) becomes a `file` artifact, listed in `metadata["broadcasts"]`.
+
+Neither step fails the task unless `fail_task_on_error` says so: a broadcast that can't start or be kept is noted in
+`metadata["broadcast_errors"]` and the run goes on.
 
 ## Licenses: `urn:game:license/v1`
 
@@ -630,8 +712,10 @@ uv venv && uv pip install -e ".[dev]"
 
 ## Not done yet
 
-- **Warcraft III moves onto the match protocol next.** Its own version is in
-  [agentenv-wc3-plugin](https://github.com/earakely-scale/agentenv-wc3-plugin)'s `agentenv_rts`.
+- **Warcraft III and OpenCiv3 move onto the broadcast and match files next.** Their own broadcasts are in their
+  plugins until then.
+- **No casters or commentary yet,** and no broadcast from a remote sandbox: the streamer reaches the env as agent-env
+  does on its own machine.
 - **Nothing calls the lobby's `cancel` yet.** Its natural caller is cleanup for a run that ends before `close_lobby`.
 - **The harness can't pause a match.** Only a game pauses its own.
 - **A player slot's address isn't a secret.** Any client that can reach the env can use another player's path. A

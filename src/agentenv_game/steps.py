@@ -8,11 +8,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
+import uuid
 from functools import partial
+from pathlib import Path
 from typing import ClassVar
 
 import httpx
 from agent_env.a2a_agent.a2a_agent import A2AAgent
+from agent_env.artifact import FileArtifact
 from agent_env.config import get_config
 from agent_env.entity_refs import EntityRef
 from agent_env.env.env import DeployedEnv, DeployedSandboxEnv
@@ -299,6 +303,68 @@ class CancelMatchTaskStep(_EndMatchTaskStep):
     entity_refs = (EntityRef.env("env_id"),)
     method = "cancel"
     default_timeout = 60
+
+
+class SaveMatchFilesTaskStep(TaskStep):
+    """Keep the files a game env keeps of its finished match (the match protocol's `files`, the game's
+    `@match_files`), such as its replay or its recording: put it after finish_match. `kinds` picks among them, else
+    the game keeps its default ones. Each file is streamed from the env, through a temporary file, into a file
+    artifact, so an hour of video never sits in memory; they are listed in the run's `metadata["match_files"]`, by
+    this step's id. What the game says it could not keep is logged."""
+
+    type: ClassVar[str] = "save_match_files"
+    entity_refs = (EntityRef.env("env_id"),)
+
+    def __init__(self, id: str, version: int | None, env_id: str, kinds: list | None = None,
+                 timeout_seconds: int = 3600, depends_on: list | None = None, fail_task_on_error: bool = False):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        if kinds is not None and not (isinstance(kinds, list) and all(isinstance(k, str) and k for k in kinds)):
+            raise ValueError("save_match_files kinds is a list of the kinds of files to keep")
+        self.env_id, self.timeout_seconds = env_id, timeout_seconds
+        self.kinds = list(kinds) if kinds is not None else None
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "env_id": self.env_id, "kinds": self.kinds,
+                "timeout_seconds": self.timeout_seconds, "fail_task_on_error": self.fail_task_on_error}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SaveMatchFilesTaskStep:
+        return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", False)},
+                   env_id=data["env_id"], **{k: data[k] for k in ("kinds", "timeout_seconds") if k in data})
+
+    async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        deployed = _deployed(context, self.env_id)
+        lobby_id = (context.metadata.get("game_lobby") or {}).get("lobby_id")
+        request = {k: v for k, v in (("lobby_id", lobby_id), ("kinds", self.kinds)) if v is not None}
+        listed = await _invoke(deployed, MATCH, "files", request, self.timeout_seconds)
+        for note in listed["notes"]:
+            log.warning("save_match_files: %s", note)
+        stem = context.instance_id or uuid.uuid4().hex
+        saved = []
+        for file in listed["files"]:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / file["name"]
+                await _download(deployed.environment_url.rstrip("/") + file["path"], path, self.timeout_seconds)
+                artifact = await asyncio.to_thread(FileArtifact.put, f"{stem}-{file['name']}",
+                                                   description=f"The {file['kind']} of env {self.env_id!r}'s match",
+                                                   file_path=str(path))
+            saved.append({"name": file["name"], "kind": file["kind"], "artifact_id": artifact.id,
+                          "version": artifact.version, "bytes": file["bytes"]})
+            log.info("save_match_files: %s (%s, %d bytes) is file artifact %s v%d", file["name"], file["kind"],
+                     file["bytes"], artifact.id, artifact.version)
+        context.metadata.setdefault("match_files", {})[self.id] = saved
+        return context
+
+
+async def _download(url: str, path: Path, timeout: float) -> None:
+    headers = sandbox_request_headers_for_url(url) or {}
+    async with (httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=30)) as http,
+                http.stream("GET", url, headers=headers) as response):
+        if response.status_code != 200:
+            raise RuntimeError(f"{url}: {response.status_code} {_message((await response.aread()).decode())}")
+        with path.open("wb") as out:
+            async for chunk in response.aiter_bytes(1 << 20):
+                out.write(chunk)
 
 
 async def _slot_card(base: str, headers: dict, timeout: int) -> dict:

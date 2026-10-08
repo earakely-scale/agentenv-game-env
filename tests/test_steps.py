@@ -1,6 +1,10 @@
 """The lobby and match steps against the served example game and a fake A2A agent."""
 
+import json
+import logging
+
 import pytest
+from agent_env.artifact import FileArtifact
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
 from conftest import FakeAgent, deployed, serving
@@ -14,6 +18,7 @@ from agentenv_game.steps import (
     CloseLobbyTaskStep,
     FinishMatchTaskStep,
     OpenLobbyTaskStep,
+    SaveMatchFilesTaskStep,
 )
 
 pytestmark = pytest.mark.anyio
@@ -140,6 +145,42 @@ async def test_cancel_match_ends_the_match_where_it_stands():
     assert context.metadata["game_match"]["player_states"]["a"]["status"] == "undecided"
 
 
+async def test_save_match_files_keeps_each_file_of_the_finished_match_as_a_file_artifact(local_stores, caplog):
+    game = TicTacToe()
+    async with deployed(game) as env:
+        context = TaskStepContext(deployed_envs=[env], instance_id="run-1")
+        save = SaveMatchFilesTaskStep(id="files", version=None, env_id="tictactoe")
+        await opening().execute(context)
+        await add("slot-x", "x", "agent", "alice", register=False).execute(context)
+        await add("slot-o", "o", "ai").execute(context)
+        await CloseLobbyTaskStep(id="close", version=None, env_id="tictactoe").execute(context)
+        with pytest.raises(RuntimeError, match="match files: match_not_final"):
+            await save.execute(context)
+        game._put(0)
+        game._ai_moves()
+        game._put(3)
+        game._ai_moves()
+        game._put(6)
+        await save.execute(context)
+        with pytest.raises(RuntimeError, match="keeps only its moves"):
+            await SaveMatchFilesTaskStep(id="replay", version=None, env_id="tictactoe", kinds=["replay"]).execute(
+                context)
+    [kept] = context.metadata["match_files"]["files"]
+    name = f"tictactoe-{game.lobby.lobby_id}.json"
+    assert (kept["name"], kept["kind"]) == (name, "moves") and kept["artifact_id"].endswith(f"run-1-{name}")
+    content = FileArtifact.get(kept["artifact_id"], kept["version"]).load()
+    assert len(content) == kept["bytes"] and json.loads(content)["winner"] == "x"
+    async with deployed(Race()) as env:
+        context = TaskStepContext(deployed_envs=[env])
+        await opening().execute(context)
+        await add("slot-c", "c", "ai").execute(context)
+        await CloseLobbyTaskStep(id="close", version=None, env_id="tictactoe").execute(context)
+        await FinishMatchTaskStep(id="finish", version=None, env_id="tictactoe").execute(context)
+        with caplog.at_level(logging.WARNING):
+            await SaveMatchFilesTaskStep(id="files", version=None, env_id="tictactoe").execute(context)
+    assert context.metadata["match_files"] == {"files": []} and "keeps no files of its matches" in caplog.text
+
+
 def test_the_steps_load_from_task_json():
     registry = get_task_step_registry()
     data = {"id": "slot", "type": "add_player_slot", "env_id": "tictactoe", "player_id": "o", "player_kind": "ai",
@@ -156,6 +197,11 @@ def test_the_steps_load_from_task_json():
                                                  "timeout_seconds": 30})
     assert (finish.to_dict()["timeout_seconds"], cancel.to_dict()["timeout_seconds"]) == (7200, 30)
     assert finish.entity_refs == cancel.entity_refs and finish.entity_refs
+    files = registry["save_match_files"].from_dict({"id": "files", "type": "save_match_files", "env_id": "tictactoe",
+                                                   "kinds": ["moves"]})
+    assert files.to_dict()["kinds"] == ["moves"] and files.fail_task_on_error is False
+    with pytest.raises(ValueError, match="kinds is a list"):
+        SaveMatchFilesTaskStep(id="files", version=None, env_id="tictactoe", kinds="moves")
     with pytest.raises(ValueError, match=r"min \(3\) is more than max \(2\)"):
         opening(player_slot_limits={"min": 3, "max": 2})
     with pytest.raises(ValueError, match="names its agent, player_name"):

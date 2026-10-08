@@ -173,7 +173,8 @@ async def test_the_match_over_http():
         methods = client.extension_params(card, MATCH)["methods"]
         assert {m: (v["method"], v["endpoint"]) for m, v in methods.items()} == {
             "get": ("GET", "/agentenv/ext/match"), "player_ready": ("POST", "/agentenv/ext/match/player_ready"),
-            "finish": ("POST", "/agentenv/ext/match/finish"), "cancel": ("POST", "/agentenv/ext/match/cancel")}
+            "finish": ("POST", "/agentenv/ext/match/finish"), "cancel": ("POST", "/agentenv/ext/match/cancel"),
+            "files": ("POST", "/agentenv/ext/match/files")}
         match = f"{base}/agentenv/ext/match"
 
         async def post(method, body):
@@ -189,7 +190,8 @@ async def test_the_match_over_http():
         assert await client.invoke_extension(base, card, MATCH, method="get") == {
             "lobby_id": opened["lobby_id"], "status": "started",
             "progress": [{"name": "game", "unit": "moves", "value": 0, "limit": 9}],
-            "player_states": {"x": {"status": "undecided"}, "o": {"status": "undecided"}}}
+            "player_states": {"x": {"status": "undecided"}, "o": {"status": "undecided"}},
+            "spectator_url": "/spectators"}
         for method, body, code in (("player_ready", {}, "bad_request"),
                                    ("player_ready", {"player_id": "z"}, "bad_player"),
                                    ("player_ready", {"player_id": 1}, "bad_request"),
@@ -225,3 +227,71 @@ async def test_a_gated_match_starts_once_its_players_say_they_are_ready_and_a_br
         assert failed.status_code == 500 and failed.json()["error"] == {
             "code": "match_failed", "message": "RuntimeError: the engine stopped"}
         assert (await http.get(f"{base}/agentenv/ext/match")).json()["status"] == "failed"
+
+
+async def two_ais(env) -> str:
+    """A tic-tac-toe match between the game's AIs, played to its end as the lobby closes; its lobby_id."""
+    opened = await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="open")
+    await fill(env, player_id="x", player_kind="ai")
+    await fill(env, player_id="o", player_kind="ai")
+    await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="close")
+    return opened["lobby_id"]
+
+
+async def test_spectators_get_their_own_card_and_the_game_knows_their_requests():
+    async with deployed(TicTacToe()) as env, httpx.AsyncClient() as http:
+        card = f"{env.environment_url}/spectators/.well-known/agent-env.json"
+        before = await http.get(card)
+        assert before.status_code == 404 and before.json()["error"]["code"] == "no_spectator_view"
+        await two_ais(env)
+        spectators = (await http.get(card)).json()
+        assert spectators["name"] == "tictactoe/spectators"
+        assert spectators["additionalInterfaces"] == [{"url": "/spectate", "transport": "http"}]
+        assert "fetch(\"board.json\")" in (await http.get(f"{env.environment_url}/spectators/spectate")).text
+        watched = (await http.get(f"{env.environment_url}/spectators/board.json")).json()
+        assert watched["spectating"] is True and watched["winner"] is not None
+        assert (await http.get(f"{env.environment_url}/board.json")).json()["spectating"] is False
+    async with deployed(Race()) as env, httpx.AsyncClient() as http:
+        await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="open")
+        await fill(env, player_id="c", player_kind="ai")
+        await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="close")
+        assert "spectator_url" not in await client.invoke_extension(env.environment_url, env.environment_card,
+                                                                    MATCH, method="get")
+        gone = await http.get(f"{env.environment_url}/spectators/.well-known/agent-env.json")
+        assert gone.status_code == 404 and gone.json()["error"]["code"] == "no_spectator_view"
+
+
+async def test_a_finished_match_lists_its_files_and_serves_each_until_the_next_lobby():
+    async with deployed(TicTacToe()) as env, httpx.AsyncClient() as http:
+        base, card = env.environment_url, env.environment_card
+        files = f"{base}/agentenv/ext/match/files"
+        await client.invoke_extension(base, card, LOBBY, {}, method="open")
+        await fill(env, player_id="x", player_kind="agent", player_name="alice")
+        await fill(env, player_id="o", player_kind="ai")
+        await client.invoke_extension(base, card, LOBBY, {}, method="close")
+        early = await http.post(files, json={})
+        assert early.status_code == 400 and early.json()["error"]["code"] == "match_not_final"
+        lobby_id = await two_ais(env)
+        listed = await client.invoke_extension(base, card, MATCH, {"lobby_id": lobby_id}, method="files")
+        [kept] = listed["files"]
+        name = f"tictactoe-{lobby_id}.json"
+        assert {k: kept[k] for k in ("name", "kind", "content_type", "path")} == {
+            "name": name, "kind": "moves", "content_type": "application/json",
+            "path": f"/agentenv/ext/match/files/{name}"} and listed["notes"] == []
+        served = await http.get(base + kept["path"])
+        assert served.headers["content-type"] == "application/json" and len(served.content) == kept["bytes"]
+        assert served.json()["moves"][0] == {"mark": "x", "cell": 0}
+        refused = await http.post(files, json={"kinds": ["replay"]})
+        assert refused.status_code == 400 and "keeps only its moves" in refused.json()["error"]["message"]
+        assert (await http.post(files, json={"kinds": "moves"})).json()["error"]["code"] == "bad_request"
+        unknown = await http.get(f"{files}/other.json")
+        assert unknown.status_code == 404 and unknown.json()["error"]["code"] == "unknown_file"
+        await client.invoke_extension(base, card, LOBBY, {}, method="open")
+        assert (await http.get(base + kept["path"])).status_code == 404
+    async with deployed(Race()) as env:
+        await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="open")
+        await fill(env, player_id="c", player_kind="ai")
+        await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="close")
+        await client.invoke_extension(env.environment_url, env.environment_card, MATCH, {}, method="finish")
+        none = await client.invoke_extension(env.environment_url, env.environment_card, MATCH, {}, method="files")
+        assert none["files"] == [] and none["notes"][0].endswith("keeps no files of its matches")

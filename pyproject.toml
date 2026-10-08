@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentenv-game-env"
-version = "0.3.0"
-description = "Game envs for AgentEnv: a lobby of player slots that agents, people and the game's own AI fill, the match it creates, a base class that serves both, and the task steps that run them."
+version = "0.4.0"
+description = "Game envs for AgentEnv: a lobby of player slots that agents, people and the game's own AI fill, the match it creates, a base class that serves both, the task steps that run them, and the broadcast of a match."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -37,6 +37,9 @@ add_player_slot = "agentenv_game.steps:AddPlayerSlotTaskStep"
 close_lobby = "agentenv_game.steps:CloseLobbyTaskStep"
 finish_match = "agentenv_game.steps:FinishMatchTaskStep"
 cancel_match = "agentenv_game.steps:CancelMatchTaskStep"
+save_match_files = "agentenv_game.steps:SaveMatchFilesTaskStep"
+start_broadcast = "agentenv_game.broadcast.steps:StartBroadcastTaskStep"
+save_broadcast = "agentenv_game.broadcast.steps:SaveBroadcastTaskStep"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentenv_game"]

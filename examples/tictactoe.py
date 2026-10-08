@@ -1,22 +1,29 @@
 """Tic-tac-toe as a game env: two players, x and o, each an agent or the game's AI, put their marks on a 3x3 board in
 turn. A player slot's id is its mark. Its match starts as the lobby closes, since a turn game has nothing to line up,
-and it can't be played out without its players, so finishing it early cancels it.
+and it can't be played out without its players, so finishing it early cancels it. Spectators watch the board at
+/spectators/spectate, and a finished match keeps its moves as a file.
 
     python examples/tictactoe.py      # serves it on port 18765 (MCP_PORT); each player plays at /players/<x|o>/mcp
 """
 
 from __future__ import annotations
 
+import json
+import tempfile
+from pathlib import Path
 from typing import Literal
 
 from agentenv_protocol import environment_card, tool
+from agentenv_protocol.types import EnvironmentCapabilities, EnvironmentCard, EnvironmentInterface
 from pydantic import BaseModel, ConfigDict
+from starlette.responses import HTMLResponse, JSONResponse
 
 from agentenv_game import (
     AgentEnvGameEnv,
     Counter,
     GameError,
     Lobby,
+    MatchFile,
     MatchReport,
     MatchStatus,
     PlayerKind,
@@ -24,12 +31,25 @@ from agentenv_game import (
     PlayerSlotLimits,
     check_player_slot,
     create_game,
+    match_files,
     match_report,
     player_slot_limits,
+    spectator_card,
 )
 
 MARKS = ("x", "o")
 LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+SPECTATE = """<!doctype html><meta charset="utf-8"><title>tic-tac-toe</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#101418;font:bold 22vmin sans-serif}
+#b{display:grid;grid-template-columns:repeat(3,1fr);gap:1.5vmin;background:#2c343c}
+#b div{width:26vmin;height:26vmin;display:grid;place-items:center;background:#101418}.x{color:#e8b04a}.o{color:#5aa9e6}
+</style><div id="b"></div><script>
+async function draw() {
+  const s = await (await fetch("board.json")).json();
+  document.getElementById("b").innerHTML = s.board.map(c => `<div class="${c.trim()}">${c.trim()}</div>`).join("");
+}
+draw(); setInterval(draw, 500);
+</script>"""
 
 
 @environment_card(name="tictactoe")
@@ -39,9 +59,10 @@ class TicTacToe(AgentEnvGameEnv):
         first: Literal["x", "o"] = "x"
         """Who moves first."""
 
-    board: list[str] = []
+    board: list[str] = [" "] * 9
     turn, winner = "x", None
     players: dict[str, PlayerSlot] = {}
+    moves: list[dict] = []
 
     # ---- the lobby: what this game takes ----
 
@@ -59,7 +80,7 @@ class TicTacToe(AgentEnvGameEnv):
     @create_game
     async def new_game(self, lobby: Lobby) -> None:
         self.players = {s.player_id: s for s in lobby.player_slots}
-        self.board, self.turn, self.winner = [" "] * 9, lobby.game_settings["first"], None
+        self.board, self.turn, self.winner, self.moves = [" "] * 9, lobby.game_settings["first"], None, []
         self._ai_moves()
 
     @match_report
@@ -71,6 +92,35 @@ class TicTacToe(AgentEnvGameEnv):
             progress=[Counter(name="game", unit="moves", value=9 - self.board.count(" "), limit=9)],
             outcomes={m: "drawn" if self.winner == "draw" else "won" if m == self.winner else "lost"
                       for m in MARKS} if over else {})
+
+    @spectator_card
+    def spectators(self) -> EnvironmentCard:
+        return EnvironmentCard(name="tictactoe/spectators",
+                               additionalInterfaces=[EnvironmentInterface(url="/spectate", transport="http")],
+                               capabilities=EnvironmentCapabilities(operations=[]))
+
+    @match_files
+    async def kept(self, kinds: list[str] | None) -> list[MatchFile]:
+        if unknown := sorted(set(kinds or ()) - {"moves"}):
+            raise ValueError(f"tic-tac-toe keeps only its moves, not {unknown}")
+        path = Path(tempfile.mkdtemp(prefix="tictactoe-")) / "moves.json"
+        path.write_text(json.dumps({"moves": self.moves, "winner": self.winner}))
+        return [MatchFile(name=f"tictactoe-{self.lobby.lobby_id}.json", kind="moves", content_type="application/json",
+                          file=path)]
+
+    def create_app(self):
+        app = super().create_app()
+
+        @app.custom_route("/spectate", methods=["GET"])
+        async def spectate(request):
+            return HTMLResponse(SPECTATE)
+
+        @app.custom_route("/board.json", methods=["GET"])
+        async def board(request):
+            return JSONResponse({"board": self.board, "turn": self.turn, "winner": self.winner,
+                                 "spectating": self.spectating()})
+
+        return app
 
     # ---- the game: what each player can do ----
 
@@ -105,6 +155,7 @@ class TicTacToe(AgentEnvGameEnv):
 
     def _put(self, cell: int) -> None:
         self.board[cell] = self.turn
+        self.moves.append({"mark": self.turn, "cell": cell})
         if any(self.board[a] == self.board[b] == self.board[c] == self.turn for a, b, c in LINES):
             self.winner = self.turn
         elif " " not in self.board:
