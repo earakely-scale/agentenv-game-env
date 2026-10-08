@@ -18,7 +18,6 @@ from agentenv_game import (
     LicenseItem,
     LicenseParts,
     LobbyError,
-    Occupant,
     SlotRequest,
     create_game,
     install_license,
@@ -57,10 +56,10 @@ def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-def seated(game) -> None:
+def filled(game) -> None:
+    game.new_lobby()
     for name, mark in (("alice", "x"), ("bob", "o")):
-        game.fill_slot(SlotRequest(occupant=Occupant(kind="agent", name=name),
-                                   additional_settings={"faction": mark}))
+        game.fill_slot(SlotRequest(player_id=mark, player_kind="agent", player_name=name))
 
 
 def refused(code, call, *args, **kwargs):
@@ -73,20 +72,20 @@ def refused(code, call, *args, **kwargs):
 async def test_a_game_without_a_license_needs_nothing():
     game = TicTacToe()
     assert game.license_missing() == [] and game.license_status() == {"missing": [], "installed": []}
-    seated(game)
-    assert (await game.close_lobby())["state"] == "closed"
+    filled(game)
+    assert (await game.close_lobby()).status == "closed"
 
 
 async def test_the_lobby_does_not_close_until_every_part_is_given():
     game = Licensed()
-    seated(game)
+    filled(game)
     with pytest.raises(LobbyError) as e:
         await game.close_lobby()
     assert e.value.code == "not_licensed" and "file board.lic (from your purchase)" in e.value.message
     assert "acceptance ttt-terms (https://example.com/terms)" in e.value.message
     game.add_license(files={"board.lic": b64(BOARD)}, keys={"serial": "TTT-0042"}, accept=["ttt-terms"])
     assert game.given == LicenseParts(files={"board.lic": BOARD}, keys={"serial": "TTT-0042"}, accepted=["ttt-terms"])
-    assert (await game.close_lobby())["state"] == "closed"
+    assert (await game.close_lobby()).status == "closed"
 
 
 def test_each_part_is_checked_against_the_item_it_fills():

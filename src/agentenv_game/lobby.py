@@ -1,10 +1,9 @@
-"""The lobby, `urn:game:lobby/v1`: the player slots of the next game, filled one occupant at a time before the game
+"""The lobby, `urn:game:lobby/v1`: the player slots of the next game, filled one player at a time before the game
 exists. The types and the checks every game shares; `AgentEnvGameEnv` (env.py) serves them, and the add_player_slot
 and start_match steps (steps.py) call them."""
 
 from __future__ import annotations
 
-import itertools
 from enum import StrEnum
 from typing import Any
 
@@ -14,18 +13,29 @@ LOBBY = "urn:game:lobby/v1"
 NAME = r"^[A-Za-z0-9_.-]{1,64}$"
 
 
-class LobbyState(StrEnum):
+class LobbyStatus(StrEnum):
+    NOT_OPENED = "not_opened"
     OPEN = "open"
     CLOSED = "closed"
+    """The game was created from the player slots."""
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    """The game couldn't be created from the player slots."""
 
 
-class OccupantKind(StrEnum):
+class PlayerKind(StrEnum):
     AGENT = "agent"
     """Plays through the env's API: a model, a scripted bot, a person with an MCP client."""
     HUMAN = "human"
     """A person through the game's own UI."""
     AI = "ai"
     """The game's built-in AI."""
+
+
+NOT_OPEN = {LobbyStatus.NOT_OPENED: "no lobby is open: open one first",
+            LobbyStatus.CLOSED: "the lobby is closed, its game created: open a new one for another game",
+            LobbyStatus.CANCELLED: "the lobby was cancelled: open a new one for another game",
+            LobbyStatus.FAILED: "the lobby failed, its game not created: open a new one to try again"}
 
 
 class LobbyError(Exception):
@@ -41,96 +51,97 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class Occupant(_Model):
-    kind: OccupantKind
-    name: str | None = Field(None, pattern=NAME)
-
-    @model_validator(mode="after")
-    def _named(self) -> Occupant:
-        if self.kind is not OccupantKind.AI and self.name is None:
-            raise ValueError(f"{self.kind.value} occupants need a name")
-        return self
-
-
-class PlayerSlotSettings(_Model):
+class PlayerSlotLimits(_Model):
     min: int | None = Field(None, ge=0)
-    """At close: at least this many slots filled."""
+    """At close: at least this many player slots filled."""
     max: int | None = Field(None, ge=1)
-    """At fill: no more than this many slots, numbered from 0."""
-    additional_settings: dict[str, Any] = {}
-    """The game's own: which occupants, factions, teams and AI levels it takes."""
+    """At fill: no more than this many."""
+    player_kinds: list[PlayerKind] = [PlayerKind.AGENT]
+    """Who may play: the kinds of player the game takes."""
 
     @model_validator(mode="after")
-    def _ordered(self) -> PlayerSlotSettings:
+    def _ordered(self) -> PlayerSlotLimits:
         if self.min is not None and self.max is not None and self.min > self.max:
             raise ValueError(f"min ({self.min}) is more than max ({self.max})")
         return self
 
 
-class Connect(_Model):
-    """How an agent's MCP client reaches its slot: a path under the env's address, and headers to send."""
-
-    path: str
-    headers: dict[str, str] = {}
-
-
 class SlotRequest(_Model):
-    """What fill takes: the occupant, a slot (the next free one by default), and the game's settings for the slot."""
+    """What fill takes: the player slot's id, who plays it, and the game's settings for it."""
 
-    occupant: Occupant
-    slot: int | None = Field(None, ge=0)
-    additional_settings: dict[str, Any] = {}
+    lobby_id: str | None = None
+    """The lobby the fill is for: a lobby opened since refuses it."""
+    player_id: str = Field(pattern=NAME)
+    player_kind: PlayerKind
+    player_name: str | None = Field(None, pattern=NAME)
+    game_settings: dict[str, Any] = {}
 
 
 class PlayerSlot(_Model):
-    slot: int = Field(ge=0)
-    occupant: Occupant
-    additional_settings: dict[str, Any] = {}
-    """The game's own: faction, team, AI level, label."""
-    connect: Connect | None = None
-    """Agent slots: set by the env."""
-    play: str | None = None
-    """Human slots: a link for the person, set by the env."""
+    player_id: str = Field(pattern=NAME)
+    """The game's own name for the player slot (a player number, a role, a colour): the protocol never reads it."""
+    player_kind: PlayerKind
+    player_name: str | None = Field(None, pattern=NAME)
+    """Who plays it; for an agent, the agent-env agent the slot is registered with. Never for the game's AI."""
+    game_settings: dict[str, Any] = {}
+    """The game's own, checked against its PlayerSlotSettings: faction, team, label, AI level."""
+    environment_url: str | None = None
+    """Agent and human slots: the path, under the env's address, where the player slot's own env card is served."""
+    headers: dict[str, str] = {}
+    """What a client sends to reach that environment."""
 
 
 class Lobby(_Model):
-    state: LobbyState = LobbyState.OPEN
-    additional_settings: dict[str, Any] = {}
-    """The game's and the task's own settings: a map, a seed, a time limit."""
-    player_slot_settings: PlayerSlotSettings | None = None
-    """None: any number of slots."""
-    slots: list[PlayerSlot] = []
+    lobby_id: str | None = None
+    """New on each open; none until one is opened."""
+    status: LobbyStatus = LobbyStatus.NOT_OPENED
+    game_settings: dict[str, Any] = {}
+    """The game's own, checked against its GameSettings, every default filled in: a map, a seed, a time limit."""
+    player_slot_limits: PlayerSlotLimits | None = None
+    player_slots: list[PlayerSlot] = []
+    """In the order they were filled, which means nothing: look a player slot up by its player_id."""
+
+    def slot(self, player_id: str) -> PlayerSlot | None:
+        return next((s for s in self.player_slots if s.player_id == player_id), None)
 
     def named(self, name: str) -> PlayerSlot | None:
-        return next((s for s in self.slots if s.occupant.name == name), None)
+        return next((s for s in self.player_slots if s.player_name == name), None)
+
+    def check_open(self, lobby_id: str | None = None) -> None:
+        """Refuses a call for a lobby opened before this one, then one for a lobby that isn't open."""
+        if lobby_id is not None and self.lobby_id is not None and lobby_id != self.lobby_id:
+            raise LobbyError("lobby_replaced", f"lobby {lobby_id} was replaced by {self.lobby_id}")
+        if self.status is not LobbyStatus.OPEN:
+            raise LobbyError("lobby_not_open", NOT_OPEN[self.status])
 
     def place(self, request: SlotRequest) -> tuple[PlayerSlot, bool]:
-        """The slot `request` gets, and whether the lobby has it already (a repeated fill: the same name, slot and
-        settings). A new slot is not added yet: the game checks it first. Raises LobbyError for the shared checks."""
-        if self.state is not LobbyState.OPEN:
-            raise LobbyError("lobby_closed", "the lobby is closed: open a new one for another game")
-        name = request.occupant.name
-        if name is not None and (same := self.named(name)) is not None:
-            if (same.occupant == request.occupant and request.slot in (None, same.slot)
-                    and same.additional_settings == request.additional_settings):
+        """The player slot `request` gets in this open lobby, and whether the lobby has it already (a repeated fill:
+        the same id, player and settings). A new one is not added yet: the game checks it first. Raises LobbyError
+        for the shared checks."""
+        limits = self.player_slot_limits or PlayerSlotLimits()
+        if request.player_kind not in limits.player_kinds:
+            raise LobbyError("bad_player", f"the game takes {', '.join(limits.player_kinds)} players, not "
+                                           f"{request.player_kind}")
+        if request.player_kind is PlayerKind.AI and request.player_name is not None:
+            raise LobbyError("bad_player", "the game's AI plays an ai player slot, so it has no player_name")
+        slot = PlayerSlot(player_id=request.player_id, player_kind=request.player_kind,
+                          player_name=request.player_name, game_settings=dict(request.game_settings))
+        if (same := self.slot(slot.player_id)) is not None:
+            if (same.player_kind, same.player_name, same.game_settings) == (
+                    slot.player_kind, slot.player_name, slot.game_settings):
                 return same, True
-            raise LobbyError("name_taken", f"{name!r} already has slot {same.slot}, with other settings")
-        limit = (self.player_slot_settings or PlayerSlotSettings()).max
-        if limit is not None and len(self.slots) >= limit:
-            raise LobbyError("lobby_full", f"the lobby's {limit} slots are taken")
-        used = {s.slot for s in self.slots}
-        index = request.slot if request.slot is not None else next(i for i in itertools.count() if i not in used)
-        if limit is not None and index >= limit:
-            raise LobbyError("bad_slot", f"slot {index} is out of range: the lobby has slots 0 to {limit - 1}")
-        if index in used:
-            raise LobbyError("slot_taken", f"slot {index} is taken")
-        return PlayerSlot(slot=index, occupant=request.occupant,
-                          additional_settings=dict(request.additional_settings)), False
+            raise LobbyError("slot_taken", f"player slot {slot.player_id!r} is taken")
+        if slot.player_name is not None and (other := self.named(slot.player_name)) is not None:
+            raise LobbyError("name_taken", f"{slot.player_name!r} already plays player slot {other.player_id!r}")
+        if limits.max is not None and len(self.player_slots) >= limits.max:
+            raise LobbyError("lobby_full", f"the lobby's {limits.max} player slots are taken")
+        return slot, False
 
     def add(self, slot: PlayerSlot) -> None:
-        self.slots = sorted([*self.slots, slot], key=lambda s: s.slot)
+        self.player_slots = [*self.player_slots, slot]
 
     def check_close(self) -> None:
-        least = (self.player_slot_settings or PlayerSlotSettings()).min
-        if least is not None and len(self.slots) < least:
-            raise LobbyError("too_few_slots", f"the game needs {least} players, the lobby has {len(self.slots)}")
+        least = (self.player_slot_limits or PlayerSlotLimits()).min
+        if least is not None and len(self.player_slots) < least:
+            raise LobbyError("too_few_slots", f"the game needs {least} players, the lobby has "
+                                              f"{len(self.player_slots)}")

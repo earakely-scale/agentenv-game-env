@@ -1,9 +1,10 @@
-"""add_player_slot and start_match against the served example game and a fake A2A agent."""
+"""create_match, add_player_slot and start_match against the served example game and a fake A2A agent."""
 
 import pytest
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
 from conftest import FakeAgent, deployed, serving
+from test_lobby import Arena
 from tictactoe import TicTacToe
 
 from agentenv_game.steps import AddPlayerSlotTaskStep, CreateMatchTaskStep, StartMatchTaskStep
@@ -11,25 +12,31 @@ from agentenv_game.steps import AddPlayerSlotTaskStep, CreateMatchTaskStep, Star
 pytestmark = pytest.mark.anyio
 
 
-def add(id, occupant, mark, **more):
-    return AddPlayerSlotTaskStep(id=id, version=None, env_id="tictactoe", occupant=occupant,
-                                 additional_settings={"faction": mark}, **more)
+def add(id, player_id, player_kind, player_name=None, **more):
+    return AddPlayerSlotTaskStep(id=id, version=None, env_id="tictactoe", player_id=player_id,
+                                 player_kind=player_kind, player_name=player_name, **more)
 
 
-async def test_an_agent_gets_its_slots_address_and_start_match_creates_the_game():
+def match(**more):
+    return CreateMatchTaskStep(id="match", version=None, env_id="tictactoe", **more)
+
+
+async def test_an_agent_gets_its_slots_mcp_address_from_the_slot_card_and_start_match_creates_the_game():
     game, alice = TicTacToe(), FakeAgent()
     async with deployed(game) as env, serving(alice.app) as agent_url:
         context = TaskStepContext(deployed_envs=[env], deployed_agents=[alice.deployed(agent_url, "alice")])
-        step = add("seat-alice", {"kind": "agent", "name": "alice"}, "x")
+        await match().execute(context)
+        step = add("slot-x", "x", "agent", "alice")
         await step.execute(context)
-        await step.execute(context)   # a rerun: the same slot, registered once
-        await add("seat-ai", {"kind": "ai"}, "o").execute(context)
+        await step.execute(context)   # a rerun: the same player slot, registered once
+        await add("slot-o", "o", "ai").execute(context)
         await StartMatchTaskStep(id="start", version=None, env_id="tictactoe").execute(context)
-    url = env.environment_url + "/players/alice/mcp"
+    url = env.environment_url + "/players/x/mcp"
     assert alice.servers == {"tictactoe": {"url": url, "headers": None, "name": "tictactoe"}}
-    assert context.metadata["game_slots"]["alice"]["url"] == url
-    assert context.metadata["game_slots"]["slot-1"]["occupant"] == {"kind": "ai"}
-    assert context.metadata["game_lobby"]["state"] == "closed" and game.board == [" "] * 9
+    slots = context.metadata["game_slots"]
+    assert slots["x"]["registered"] == [url] and slots["x"]["interfaces"] == [{"url": url, "transport": "mcp"}]
+    assert slots["o"] == {"player_id": "o", "player_kind": "ai", "game_settings": {}, "headers": {}}
+    assert context.metadata["game_lobby"]["status"] == "closed" and game.board == [" "] * 9
 
 
 async def test_an_agent_that_already_has_the_envs_address_is_refused():
@@ -37,51 +44,79 @@ async def test_an_agent_that_already_has_the_envs_address_is_refused():
     async with deployed(TicTacToe()) as env, serving(alice.app) as agent_url:
         alice.servers["tictactoe"] = {"url": env.mcp_url}
         context = TaskStepContext(deployed_envs=[env], deployed_agents=[alice.deployed(agent_url, "alice")])
+        await match().execute(context)
         with pytest.raises(RuntimeError, match='deploy players with "env_ids": \\[\\]'):
-            await add("seat", {"kind": "agent", "name": "alice"}, "x").execute(context)
+            await add("slot", "x", "agent", "alice").execute(context)
 
 
 async def test_a_slot_kept_for_a_player_that_connects_on_its_own_and_a_refusal():
     async with deployed(TicTacToe()) as env:
         context = TaskStepContext(deployed_envs=[env])
+        await match().execute(context)
         with pytest.raises(RuntimeError, match="no deploy_agent step deployed an agent named 'alice'"):
-            await add("seat", {"kind": "agent", "name": "alice"}, "x").execute(context)
-        await add("seat", {"kind": "agent", "name": "bob"}, "o", register=False).execute(context)
-        assert context.metadata["game_slots"]["bob"]["url"] == env.environment_url + "/players/bob/mcp"
-        with pytest.raises(RuntimeError, match="lobby fill: bad_settings: o is taken"):
-            await add("again", {"kind": "agent", "name": "carol"}, "o", register=False).execute(context)
+            await add("slot", "x", "agent", "alice").execute(context)
+        await add("slot", "o", "agent", "bob", register=False).execute(context)
+        assert context.metadata["game_slots"]["o"]["interfaces"] == [
+            {"url": env.environment_url + "/players/o/mcp", "transport": "mcp"}]
+        assert "registered" not in context.metadata["game_slots"]["o"]
+        with pytest.raises(RuntimeError, match="lobby fill: slot_taken: player slot 'o' is taken"):
+            await add("again", "o", "agent", "carol", register=False).execute(context)
+
+
+async def test_the_steps_send_the_lobby_they_opened():
+    game = TicTacToe()
+    async with deployed(game) as env:
+        context = TaskStepContext(deployed_envs=[env])
+        await match().execute(context)
+        assert context.metadata["game_lobby"]["lobby_id"] == game.lobby.lobby_id
+        game.new_lobby()   # someone else opens another
+        with pytest.raises(RuntimeError, match="lobby fill: lobby_replaced"):
+            await add("slot", "o", "ai").execute(context)
+        with pytest.raises(RuntimeError, match="lobby close: lobby_replaced"):
+            await StartMatchTaskStep(id="start", version=None, env_id="tictactoe").execute(context)
+
+
+async def test_a_human_gets_the_page_their_slot_card_gives():
+    game = Arena()
+    async with deployed(game) as env:
+        context = TaskStepContext(deployed_envs=[env])
+        await match().execute(context)
+        await add("slot", "dana", "human", "dana", game_settings={"faction": "elf"}).execute(context)
+    slot = context.metadata["game_slots"]["dana"]
+    assert slot["interfaces"] == [{"url": env.environment_url + "/players/dana/play", "transport": "http"}]
+    assert slot["game_settings"] == {"faction": "elf", "label": None}
 
 
 async def test_create_match_opens_the_lobby_with_the_games_settings_and_a_runs_overrides():
     game = TicTacToe()
     async with deployed(game) as env:
         context = TaskStepContext(deployed_envs=[env])
-        step = CreateMatchTaskStep(id="match", version=None, env_id="tictactoe", additional_settings={"first": "x"})
+        step = match(game_settings={"first": "x"})
         await step.execute(context)
-        assert context.metadata["game_lobby"]["additional_settings"] == {"first": "x"} and game.lobby_opened
-        context.metadata["user_overrides"] = {"step_params": {"match": {"additional_settings": {"first": "o"}}}}
+        assert context.metadata["game_lobby"]["game_settings"] == {"first": "x"}
+        context.metadata["user_overrides"] = {"step_params": {"match": {"game_settings": {"first": "o"}}}}
         await step.execute(context)
-        assert game.lobby.additional_settings == {"first": "o"} and game.lobby.slots == []
-        refused = CreateMatchTaskStep(id="match", version=None, env_id="tictactoe",
-                                      additional_settings={"first": "z"})
-        with pytest.raises(RuntimeError, match="lobby open: bad_settings: .*who moves first"):
-            await refused.execute(TaskStepContext(deployed_envs=[env]))
+        assert game.lobby.game_settings == {"first": "o"} and game.lobby.player_slots == []
+        with pytest.raises(RuntimeError, match="lobby open: bad_settings: game_settings.first"):
+            await match(game_settings={"first": "z"}).execute(TaskStepContext(deployed_envs=[env]))
         with pytest.raises(RuntimeError, match="bad_settings: tic-tac-toe has two players"):
-            await CreateMatchTaskStep(id="m", version=None, env_id="tictactoe",
-                                      player_slot_settings={"max": 3}).execute(TaskStepContext(deployed_envs=[env]))
+            await match(player_slot_limits={"max": 3}).execute(TaskStepContext(deployed_envs=[env]))
 
 
 def test_the_steps_load_from_task_json():
     registry = get_task_step_registry()
-    data = {"id": "seat", "type": "add_player_slot", "env_id": "tictactoe", "occupant": {"kind": "ai"},
-            "additional_settings": {"faction": "o"}, "depends_on": ["match"]}
+    data = {"id": "slot", "type": "add_player_slot", "env_id": "tictactoe", "player_id": "o", "player_kind": "ai",
+            "game_settings": {"faction": "orc"}, "depends_on": ["match"]}
     step = registry["add_player_slot"].from_dict(data)
-    assert step.to_dict()["occupant"] == {"kind": "ai"} and step.to_dict()["additional_settings"] == {"faction": "o"}
+    assert {k: step.to_dict()[k] for k in ("player_id", "player_kind", "game_settings")} == {
+        "player_id": "o", "player_kind": "ai", "game_settings": {"faction": "orc"}}
     assert registry["start_match"].from_dict({"id": "start", "type": "start_match", "env_id": "tictactoe"})
-    match = registry["create_match"].from_dict({"id": "match", "type": "create_match", "env_id": "tictactoe",
-                                                "additional_settings": {"first": "o"}})
-    assert match.to_dict()["additional_settings"] == {"first": "o"} and match.to_dict()["player_slot_settings"] is None
+    opened = registry["create_match"].from_dict({"id": "match", "type": "create_match", "env_id": "tictactoe",
+                                                 "game_settings": {"first": "o"}})
+    assert opened.to_dict()["game_settings"] == {"first": "o"} and opened.to_dict()["player_slot_limits"] is None
     with pytest.raises(ValueError, match=r"min \(3\) is more than max \(2\)"):
-        CreateMatchTaskStep(id="m", version=None, env_id="tictactoe", player_slot_settings={"min": 3, "max": 2})
-    with pytest.raises(ValueError, match="agent occupants need a name"):
-        registry["add_player_slot"].from_dict({**data, "occupant": {"kind": "agent"}})
+        match(player_slot_limits={"min": 3, "max": 2})
+    with pytest.raises(ValueError, match="names its agent, player_name"):
+        registry["add_player_slot"].from_dict({**data, "player_kind": "agent"})
+    with pytest.raises(ValueError, match="player_id"):
+        registry["add_player_slot"].from_dict({**data, "player_id": "has space"})

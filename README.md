@@ -4,27 +4,29 @@ Game envs for [AgentEnv](https://github.com/scaleapi/agentenv-framework). A game
 every game env one way to say who they are:
 
 - **A lobby**, `urn:game:lobby/v1`, that the env serves. It holds the next game's player slots, which are filled one
-  occupant at a time before the game is created. An occupant is an agent, a person, or the game's own AI.
-- **`AgentEnvGameEnv`**, the base class that serves the lobby and tells each request which slot it plays. A game marks
-  its own parts of the lobby with decorators.
+  player at a time before the game is created. A player is an agent, a person, or the game's own AI.
+- **An env card for each player slot** that an agent or a person plays: the env as that player sees it, with the
+  interfaces it plays through.
+- **`AgentEnvGameEnv`**, the base class that serves both and tells each request which player slot it plays. A game
+  declares its settings as pydantic models and marks its own parts of the lobby with decorators.
 - **A license**, `urn:game:license/v1`, for a game that needs something from its user to run (license files, keys,
   terms to accept), which must never be in its image, a task file or a reply.
 - **Four task steps**: `add_license` gives a game its license from agent-env's secret store, and `create_match`,
   `add_player_slot` and `start_match` open, fill and close the lobby of any game env built on it.
 
-The same task steps then seat players in any game: one agent against the game's AI, two models against each other, a
+The same task steps then put players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent. Warcraft III's env, in
 [agentenv-wc3-plugin](https://github.com/earakely-scale/agentenv-wc3-plugin), is built on it. Its lobby takes a
-match's settings (map, seed, time limit, clock), and its slots take a race, a team, a label and, for the game's AI, a
-level.
+match's settings (map, seed, time limit, clock), and its player slots take a race, a team, a label and, for the game's
+AI, a level.
 
 ```
 deploy_env ── create_match (opens the lobby with the game's settings)
-                 ├─ add_player_slot {ai, faction: "orc", team: 2}
-                 ├─ deploy_agent p1 ── add_player_slot {agent: "p1", faction: "human", team: 1} ──┐
-                 └─ deploy_agent p2 ── add_player_slot {agent: "p2", faction: "undead", team: 1} ─┤
-                                                                                                 start_match ── prompt_agent p1, p2
-                                                                                  (the lobby closes: the game is created)
+                 ├─ add_player_slot {player_id: "2", ai, faction: "orc", team: 2}
+                 ├─ deploy_agent p1 ── add_player_slot {player_id: "0", agent p1, faction: "human", team: 1} ──┐
+                 └─ deploy_agent p2 ── add_player_slot {player_id: "1", agent p2, faction: "undead", team: 1} ─┤
+                                                                                                    start_match ── prompt_agent p1, p2
+                                                                                     (the lobby closes: the game is created)
 ```
 
 ## Install
@@ -41,37 +43,42 @@ too.
 
 ## The example: tic-tac-toe
 
-[`examples/tictactoe.py`](examples/tictactoe.py) is a complete game env in about 100 lines. It has two players, each an
-agent or the game's AI. The lobby part:
+[`examples/tictactoe.py`](examples/tictactoe.py) is a complete game env in about 100 lines. It has two players, `x` and
+`o`, each an agent or the game's AI. A player slot's id is its mark. The lobby part:
 
 ```python
-from agentenv_game import AgentEnvGameEnv, PlayerSlotSettings, check_slot, create_game, open_lobby
+from agentenv_game import AgentEnvGameEnv, LobbyError, PlayerKind, PlayerSlotLimits
+from agentenv_game import check_player_slot, create_game, player_slot_limits
 from agentenv_protocol import environment_card, tool
 
 
 @environment_card(name="tictactoe")
 class TicTacToe(AgentEnvGameEnv):
+    class GameSettings(BaseModel):    # the lobby's settings: checked, defaults filled in, schema in the card
+        model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
+        first: Literal["x", "o"] = "x"
+        """Who moves first."""
 
-    @open_lobby                       # the lobby's settings: who moves first, and two slots
-    def settings(self, additional_settings, player_slot_settings):
-        ...                           # refuse anything but {"first": "x" or "o"}
-        return {"first": additional_settings.get("first", "x")}, PlayerSlotSettings(
-            min=2, max=2, additional_settings={"occupants": ["agent", "ai"], "factions": ["x", "o"]})
+    @player_slot_limits               # two players, each an agent or the game's AI
+    def two_players(self, game_settings, requested):
+        ...                           # refuse a request for more
+        return PlayerSlotLimits(min=2, max=2, player_kinds=[PlayerKind.AGENT, PlayerKind.AI])
 
-    @check_slot                       # each slot is {"faction": "x" or "o"}, one of each
-    def one_mark_each(self, slot, lobby):
-        ...
+    @check_player_slot                # the player slots are "x" and "o"
+    def a_mark(self, slot, lobby):
+        if slot.player_id not in ("x", "o"):
+            raise LobbyError("bad_slot", ...)
 
     @create_game                      # the lobby closed: set up the board, and let the AI move if it goes first
     async def new_game(self, lobby):
-        self.players = {s.additional_settings["faction"]: s for s in lobby.slots}
+        self.players = {s.player_id: s for s in lobby.player_slots}
+        self.board, self.turn = [" "] * 9, lobby.game_settings["first"]
         ...
-        return {"first": lobby.additional_settings["first"]}
 
     @tool()
     async def mark(self, cell: int):
         """Put your mark in a free cell on your turn: 0 to 8, top left to bottom right."""
-        mine = self.player().additional_settings["faction"]    # the slot this request plays
+        mine = self.player().player_id     # the player slot this request plays
         ...
 ```
 
@@ -83,33 +90,42 @@ MCP_PORT=18765 python examples/tictactoe.py
 
 ```bash
 L=http://127.0.0.1:18765/agentenv/ext/lobby
-curl -s -XPOST $L/open -d '{"additional_settings": {"first": "x"}}'
+curl -s -XPOST $L/open -d '{"game_settings": {"first": "x"}}'
 ```
 ```json
-{"state":"open","additional_settings":{"first":"x"},
- "player_slot_settings":{"min":2,"max":2,"additional_settings":{"occupants":["agent","ai"],"factions":["x","o"]}},
- "slots":[]}
+{"lobby_id":"lb-444966b0","status":"open","game_settings":{"first":"x"},
+ "player_slot_limits":{"min":2,"max":2,"player_kinds":["agent","ai"]},"player_slots":[]}
 ```
 
-An agent's slot comes back with its address. A second "x" is refused by the game's own check:
+An agent's player slot comes back with its environment. A second `x` is refused:
 
 ```bash
-curl -s -XPOST $L/fill -d '{"occupant": {"kind": "agent", "name": "alice"}, "additional_settings": {"faction": "x"}}'
-curl -s -XPOST $L/fill -d '{"occupant": {"kind": "agent", "name": "bob"}, "additional_settings": {"faction": "x"}}'
-curl -s -XPOST $L/fill -d '{"occupant": {"kind": "ai"}, "additional_settings": {"faction": "o"}}'
+curl -s -XPOST $L/fill -d '{"player_id": "x", "player_kind": "agent", "player_name": "alice"}'
+curl -s -XPOST $L/fill -d '{"player_id": "x", "player_kind": "agent", "player_name": "bob"}'
+curl -s -XPOST $L/fill -d '{"player_id": "o", "player_kind": "ai"}'
 curl -s -XPOST $L/close
 ```
 ```json
-{"slot":0,"occupant":{"kind":"agent","name":"alice"},"additional_settings":{"faction":"x"},
- "connect":{"path":"/players/alice/mcp","headers":{}}}
-{"ok":false,"error":{"code":"bad_settings","message":"x is taken"}}                        (HTTP 400)
-{"slot":1,"occupant":{"kind":"ai"},"additional_settings":{"faction":"o"}}
-{"state":"closed", ..., "slots":[...], "game":{"first":"x"}}
+{"player_id":"x","player_kind":"agent","player_name":"alice","game_settings":{},"environment_url":"/players/x","headers":{}}
+{"ok":false,"error":{"code":"slot_taken","message":"player slot 'x' is taken"}}               (HTTP 400)
+{"player_id":"o","player_kind":"ai","game_settings":{},"headers":{}}
+{"lobby_id":"lb-444966b0","status":"closed", ..., "player_slots":[...]}
+```
+
+Alice's player slot serves its own env card at its `environment_url`:
+
+```bash
+curl -s http://127.0.0.1:18765/players/x/.well-known/agent-env.json
+```
+```json
+{"name":"tictactoe/x","protocolVersion":"1.0","url":"/agentenv","preferredTransport":"JSONRPC",
+ "additionalInterfaces":[{"url":"/mcp","transport":"mcp"}],"capabilities":{"operations":[]}}
 ```
 
 ### Play it
 
-Alice's MCP client connects to her slot's address, `/players/alice/mcp`. Every tool call there plays her slot:
+Alice's MCP client connects to the MCP interface of her player slot's card, `/players/x/mcp`. Every tool call there
+plays her slot:
 
 ```
 > show_board                         > mark {"cell": 4}
@@ -120,145 +136,182 @@ You are x.                           o |   |
 x to play.
 ```
 
-The game's AI answered at once, in the top left. At `/players/carol/mcp` the tools refuse: carol plays no slot in this
-game. At the env's own `/mcp` they refuse too, because a request there plays no one.
+The game's AI answered at once, in the top left. At `/players/carol/mcp` the tools refuse, because no player slot
+`carol` is played in this game. At the env's own `/mcp` they refuse too, because a request there plays no one.
 
 ### In an AgentEnv task
 
-Register the example as an MCP server env, as with any env (its image runs `python tictactoe.py`). A task then seats an
+Register the example as an MCP server env, as with any env (its image runs `python tictactoe.py`). A task then puts an
 agent against the game's AI:
 
 ```json
 [
   {"id": "deploy", "type": "deploy_env", "env_id": "tictactoe"},
   {"id": "agent", "type": "deploy_agent", "agent_name": "alice", "a2a_agent_id": "your-agent", "env_ids": []},
-  {"id": "match", "type": "create_match", "env_id": "tictactoe", "additional_settings": {"first": "o"},
+  {"id": "match", "type": "create_match", "env_id": "tictactoe", "game_settings": {"first": "o"},
    "depends_on": ["deploy"]},
-  {"id": "seat-alice", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match", "agent"],
-   "occupant": {"kind": "agent", "name": "alice"}, "additional_settings": {"faction": "x"}},
-  {"id": "seat-ai", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match"],
-   "occupant": {"kind": "ai"}, "additional_settings": {"faction": "o"}},
-  {"id": "start", "type": "start_match", "env_id": "tictactoe", "depends_on": ["seat-alice", "seat-ai"]},
+  {"id": "slot-x", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match", "agent"],
+   "player_id": "x", "player_kind": "agent", "player_name": "alice"},
+  {"id": "slot-o", "type": "add_player_slot", "env_id": "tictactoe", "depends_on": ["match"],
+   "player_id": "o", "player_kind": "ai"},
+  {"id": "start", "type": "start_match", "env_id": "tictactoe", "depends_on": ["slot-x", "slot-o"]},
   {"id": "play", "type": "prompt_agent", "agent_name": "alice", "depends_on": ["start"],
    "prompt": "You play tic-tac-toe through the tools. Win."}
 ]
 ```
 
-- **The agent deploys with `"env_ids": []`.** `add_player_slot` gives it its slot's address, so it plays alice's
-  slot, not the env's own address.
-- **A second agent in place of the AI** makes it model against model: deploy `bob` and seat him as `"o"`.
+- **The agent deploys with `"env_ids": []`.** `add_player_slot` gives it its player slot's MCP address, so it plays
+  `x`, not the env's own address.
+- **A second agent in place of the AI** makes it model against model: deploy `bob` and give him player slot `"o"`.
 
 ## The lobby protocol: `urn:game:lobby/v1`
 
 ### Lifecycle
 
 ```
-            open(settings)              fill(...) ×N                  close()
- (none) ─────────────────► OPEN ──────────────────────► OPEN ─────────────────► CLOSED
-                            ▲                                                     │
-                            └──────────────── open(settings) again: drops the game ┘
+              open                   close                        the match (the game's business)
+ not_opened ───────► open ──────────────────────────► closed ───► not_started → started → ...
+                      │  fill ×N      ├─ cancel ─────► cancelled   (no game)
+                      │               └─ the game can't be created ─► failed   (no game; close answers 500)
+                      └─ open again: a new lobby, dropping this one and its game
 ```
 
-- **`open`** starts an empty lobby for a game with these settings, dropping any current game.
-- **`fill`** adds one occupant while the lobby is open.
-- **`close`** creates the game from the filled slots. After that the lobby is read-only, and the game is the env's
-  business (turns, start gates, results).
+- **`open`** starts a new, empty lobby with these settings and a new `lobby_id`, dropping the last lobby and its game.
+- **`fill`** adds one player while the lobby is open.
+- **`close`** creates the game from the filled player slots. After that the lobby is read-only, and the game is the
+  env's business (turns, start gates, results).
+- **`cancel`** abandons an open lobby, for a run that ends before its game starts.
+- **`closed`, `cancelled` and `failed` are final for that lobby.** Only a new `open` changes them. A game that can't be
+  created from the slots fails the lobby: a retry opens a new one and fills it again.
 
-An env whose lobby was never opened has an open one with the game's default settings, and `lobby_opened` is false
-until a lobby is opened. A game can use that to offer its own default game to a client that never opens one.
+Before any `open`, the lobby is `not_opened`, with the game's default settings. A game can use that to offer its own
+default game to a client that never opens one.
 
 ### Methods
 
 They're advertised on the env's card, in the `urn:game:lobby/v1` extension's `params.methods`, and called with
-agentenv-protocol's `client.invoke_extension(base, card, LOBBY, params, method=...)`.
+agentenv-protocol's `client.invoke_extension(base, card, LOBBY, params, method=...)`. Each method's `request` is a
+JSON Schema, and `open`'s and `fill`'s include the game's own settings models, so a client can see what a game takes.
 
 | Method | Route | Request | Response |
 |---|---|---|---|
-| `open` | `POST /agentenv/ext/lobby/open` | `{"additional_settings": {...}, "player_slot_settings": {...}}`, both optional | the lobby |
+| `open` | `POST /agentenv/ext/lobby/open` | `{"game_settings": {...}, "player_slot_limits": {...}}`, both optional | the lobby |
 | `get` | `GET /agentenv/ext/lobby` | | the lobby |
-| `fill` | `POST /agentenv/ext/lobby/fill` | `{"occupant": {...}, "slot": n, "additional_settings": {...}}`; `slot` and `additional_settings` optional | the filled slot |
-| `close` | `POST /agentenv/ext/lobby/close` | `{}` | the lobby, plus `"game"`: what the game reports of itself |
+| `fill` | `POST /agentenv/ext/lobby/fill` | `{"player_id": ..., "player_kind": ..., "player_name": ..., "game_settings": {...}, "lobby_id": ...}`; `player_name`, `game_settings` and `lobby_id` optional | the filled player slot |
+| `close` | `POST /agentenv/ext/lobby/close` | `{"lobby_id": ...}`, optional | the lobby |
+| `cancel` | `POST /agentenv/ext/lobby/cancel` | `{"lobby_id": ...}`, optional | the lobby |
+
+**A `lobby_id` guards against a lobby opened since.** `fill`, `close` and `cancel` refuse a `lobby_id` that isn't the
+current lobby's (`lobby_replaced`). The task steps always send the one `create_match` opened.
 
 ### Types
 
 | Type | Fields |
 |---|---|
-| `Lobby` | `state`: `LobbyState`, `open` or `closed`. `additional_settings`: the game's and the task's own settings (a map, a seed, a time limit), opaque to the protocol. `player_slot_settings`: `PlayerSlotSettings` or absent (no limits). `slots`: the filled `PlayerSlot`s, by slot number. |
-| `PlayerSlotSettings` | `min`: at close, at least this many slots filled. `max`: no more than this many, numbered from 0. `additional_settings`: the game's own description of its slots (which occupants, factions, teams and AI levels it takes), opaque. All optional. |
-| `PlayerSlot` | `slot`: its number. `occupant`: an `Occupant`. `additional_settings`: the game's own settings for the slot (faction, team, AI level, a display label), opaque. `connect`: for an agent slot, set by the env. `play`: for a human slot, set by the env. |
-| `Occupant` | `kind`: `OccupantKind`. `name`: required for agents and people, optional for the AI; letters, digits, `_`, `.` and `-`, at most 64. |
-| `Connect` | `path`: under the env's address. `headers`: to send with every request. |
+| `Lobby` | `lobby_id`: new on each open. `status`: `LobbyStatus`, `not_opened`, `open`, `closed`, `cancelled` or `failed`. `game_settings`: the game's own (a map, a seed, a time limit), checked against its `GameSettings`, every default filled in. `player_slot_limits`: a `PlayerSlotLimits`. `player_slots`: the filled `PlayerSlot`s, in the order they were filled, which means nothing. |
+| `PlayerSlotLimits` | `min`: at close, at least this many player slots filled. `max`: no more than this many. `player_kinds`: the kinds of player the game takes, `["agent"]` by default. |
+| `PlayerSlot` | `player_id`: the game's own name for the player slot (a player number, a role, a mark), which the protocol never interprets. `player_kind`: `PlayerKind`. `player_name`: who plays it; for an agent, the agent-env agent the slot is registered with; never for the game's AI. `game_settings`: the game's own for the slot (faction, team, AI level, a display label), checked against its `PlayerSlotSettings`. `environment_url`: for an agent or a person, where the player slot's env card is served. `headers`: what a client sends to reach it. |
 
-The three occupant kinds:
+`player_id` and `player_name` are letters, digits, `_`, `.` and `-`, at most 64, so they can appear in paths and keys.
+A `player_id` is a string even when it's a number (`"0"`, Warcraft III's player number), so nothing does arithmetic
+on it.
 
-| `kind` | Who | Gets |
+The three kinds of player:
+
+| `player_kind` | Who | Gets |
 |---|---|---|
-| `agent` | anything that plays through the env's API: a model agent, a scripted bot, a person with an MCP client | `connect`: the path and headers whose requests play this slot |
-| `human` | a person, through the game's own UI | `play`: a link into the game (a game that takes people says how) |
-| `ai` | the game's built-in AI | nothing |
+| `agent` | anything that plays through the env's API: a model agent, a scripted bot, a person with an MCP client | an environment whose card has an MCP interface |
+| `human` | a person, through the game's own UI | an environment whose card has a page to open (an `http` interface), if the game takes people |
+| `ai` | the game's built-in AI | nothing: the game plays it |
 
-**How an agent connects is the env's choice.** By default its slot's address is `/players/<name>/mcp`. A game that
-routes by header returns `{"path": "/mcp", "headers": {"X-Game-Player": "<name>"}}`. `add_player_slot` registers the
-env's address plus the path, and the headers, with the agent. The agent never needs to know which scheme its game
-uses.
+### A player slot's env card
+
+An env can be reached through several interfaces, and its card lists them. A player slot is the env as one player sees
+it, so it has a card of its own, at `<environment_url>/.well-known/agent-env.json`:
+
+```json
+{"name": "tictactoe/x", "additionalInterfaces": [{"url": "/mcp", "transport": "mcp"}], "capabilities": {"operations": []}}
+```
+
+- **Its URLs are relative to its environment,** as any card's are: `/mcp` here is `/players/x/mcp`, and
+  agentenv-protocol's `client.mcp_path(card)` finds it.
+- **The game decides what's in it.** By default it has one MCP interface. A game that takes people gives them a page
+  there, and later a player slot could also be played by screen, or have its own tools or extensions.
+- **It exists while the player slot does.** It appears when the slot is filled, and a new `open` replaces it. An id
+  that plays no agent or human slot gets a 404 (`unknown_player`).
 
 ### Checks and errors
 
 | Checked by | What |
 |---|---|
-| the lobby, for every game | the lobby is open; the slot number is in range and free; no more than `max` slots; an agent or a person has a valid, unique name; at close, at least `min` slots |
-| the game (its decorated methods) | everything in the `additional_settings` at both levels, such as a known map, a valid faction, one slot per faction, or one AI level for the game; and whether it takes people at all |
+| the lobby, for every game | the lobby is open and is the one meant; the player's kind is one the game takes; the game's AI has no name; the `player_id` is free; a name plays one player slot; no more than `max` slots; at close, at least `min` slots and the game's license |
+| the game's settings models | every field of `game_settings` at both levels, and the defaults |
+| the game's decorated methods | what a model can't say: the `player_id`s it has, rules across player slots (one AI level for every AI), or by the kind of player |
 
 A refusal is an HTTP 400 with the protocol's error body, `{"ok": false, "error": {"code": ..., "message": ...}}`:
 
 | Code | When |
 |---|---|
-| `lobby_closed` | a fill after close, or while the game is being created |
-| `lobby_full` | every slot up to `max` is taken |
-| `bad_slot` | a slot number of `max` or more |
-| `slot_taken` | the slot is filled |
-| `name_taken` | the name already has a slot, with other settings |
-| `bad_occupant` | an occupant that isn't valid, or a person in a game that takes none |
-| `bad_settings` | the game refused the lobby's or the slot's settings; the message says why |
-| `too_few_slots` | close with fewer than `min` slots |
+| `lobby_not_open` | a fill, close or cancel when the lobby isn't open; the message says what it is |
+| `lobby_replaced` | a `lobby_id` that isn't the current lobby's |
+| `lobby_full` | every player slot up to `max` is taken |
+| `bad_slot` | a `player_id` the game doesn't have |
+| `slot_taken` | the player slot is filled, by another player or with other settings |
+| `name_taken` | the name already plays another player slot |
+| `bad_player` | a player that isn't valid, a kind the game doesn't take, or a named AI |
+| `bad_settings` | the game refused the lobby's or the player slot's settings; the message says which and why |
+| `too_few_slots` | close with fewer than `min` player slots |
 | `not_licensed` | close while the game lacks part of its license ([Licenses](#licenses-urngamelicensev1)) |
 | `bad_request` | a body that isn't a JSON object, or that has unknown fields |
 
-If creating the game fails, `close` answers 500 with `lobby_failed`. The lobby stays open, so the close can be retried.
+If creating the game fails, `close` answers 500 with `lobby_failed`, and the lobby is `failed`.
 
-**Repeats are safe.** A fill with the same name, slot and settings as one the lobby has returns that slot, and closing
-a closed lobby returns its game again. A task that resumes after a failure can rerun its lobby steps.
+**Repeats are safe.** A fill with the same `player_id`, player and settings as one the lobby has returns that player
+slot, and closing a closed lobby, or cancelling a cancelled one, returns it again. A task that resumes after a failure
+can rerun its lobby steps.
 
 ## Writing a game env
 
-Subclass `AgentEnvGameEnv` and mark the game's parts of the lobby, the way agentenv-protocol's data plane marks
-`@reset_data`:
+Subclass `AgentEnvGameEnv`. Declare the game's settings as pydantic models:
+
+| Attribute | Checks | Its schema goes in |
+|---|---|---|
+| `GameSettings` | the lobby's `game_settings`, at open | the card's `open` request |
+| `PlayerSlotSettings` | each player slot's `game_settings`, at fill | the card's `fill` request |
+
+A nested class, as in the example, or an existing model assigned (`GameSettings = MySettings`). Without one, the game
+takes no settings there. `ConfigDict(extra="forbid", use_attribute_docstrings=True)` refuses unknown keys and puts each
+field's docstring in the published schema. A rule about one model's fields, such as a map that exists, is a pydantic
+validator on it.
+
+Then mark the game's parts, the way agentenv-protocol's data plane marks `@reset_data`:
 
 | Decorator | Called | Takes (after `self`) | Returns | |
 |---|---|---|---|---|
-| `@create_game` | when the lobby closes | `lobby` | a dict: what callers learn of the game (start locations, say) | required, `async` |
-| `@open_lobby` | when a lobby opens, and for the first, default lobby | `additional_settings`, `player_slot_settings` | the two, as the lobby keeps them: checked, defaults filled in, slot limits set | optional |
-| `@check_slot` | before the lobby takes a slot | `slot`, `lobby` | nothing; raise `ValueError` to refuse | optional |
-| `@connect_slot` | for an agent slot | `slot` | a `Connect` | optional; default `/players/<name>/mcp` |
-| `@play_link` | for a human slot | `slot` | a link | optional; without it, the game takes no people |
+| `@create_game` | when the lobby closes | `lobby` | nothing; a failure fails the lobby | required, `async` |
+| `@player_slot_limits` | when a lobby opens | `game_settings` (its `GameSettings`), `requested` (the opener's `PlayerSlotLimits`) | the `PlayerSlotLimits` the lobby keeps | optional; without it, the request as given |
+| `@check_player_slot` | before the lobby takes a player slot | `slot`, `lobby` | nothing; raise `ValueError` to refuse | optional |
+| `@player_slot_card` | for an agent's or a person's player slot | `slot` | its `EnvironmentCard` | optional; default: one MCP interface |
 | `@license_needs` | for the license's status, and before the lobby closes | nothing | the `LicenseItem`s the game still lacks; empty when licensed | optional, with `@install_license` |
 | `@install_license` | when parts arrive | `parts`: a `LicenseParts` | nothing; raise `ValueError` to refuse a part | with `@license_needs` |
 
 - **One method per decorator, across the class and its bases.** The method name is yours.
-- **A `ValueError` from your method is the caller's `bad_settings`,** with your message.
+- **A `ValueError` from your method is the caller's `bad_settings`,** with your message. Raise a `LobbyError` to give
+  another code: `bad_slot` for a `player_id` the game doesn't have.
 - **The marks are checked before the env serves.** That covers the count, `@create_game` being present and async, and
   the number of arguments. A mistake fails at `create_app()` or the first lobby call, not mid-game.
 
-In the game's own tools and extensions, **`self.player()`** is the agent slot the current request plays. It's `None`
-at the env's own address, and a request for a name without a slot is refused. To route by a header instead of a path,
-set `player_header = "X-Game-Player"` on the class.
+In the game's own tools and extensions, **`self.player()`** is the player slot the current request plays, by its
+`/players/<player_id>` address. It's `None` at the env's own address, and a request for an id that plays no agent or
+human slot is refused.
 
 **In process,** as tests or a game's own default setup use it: `self.lobby`, `self.new_lobby(...)`,
-`self.fill_slot(SlotRequest(...))` and `await self.close_lobby()` do what the four methods do.
+`self.fill_slot(SlotRequest(...))`, `await self.close_lobby()`, `self.cancel_lobby()` and `self.slot_card(player_id)`
+do what the methods do.
 
-**Serving:** `serve()` or `create_app()`, as for any AgentEnv environment. `create_app()` adds the lobby's routes and
-the player routing (the SDK serves one handler per extension, so the lobby's other methods are added there).
-`mount()` onto an app of your own isn't supported.
+**Serving:** `serve()` or `create_app()`, as for any AgentEnv environment. `create_app()` adds the lobby's routes, the
+player slots' cards and the routing (the SDK serves one handler per extension, so the lobby's other methods are added
+there). `mount()` onto an app of your own isn't supported.
 
 ## The task steps
 
@@ -270,38 +323,41 @@ the player routing (the SDK serves one handler per extension, so the lobby's oth
 | Field | |
 |---|---|
 | `env_id` | the game env |
-| `additional_settings` | the game's own settings for the match (tic-tac-toe: `first`; Warcraft III: `map`, `seed`, `time_limit_seconds`, `mode`, ...) |
-| `player_slot_settings` | optional: `{"min": n, "max": n}` to narrow the game's own limits |
+| `game_settings` | the game's own settings for the match, as its card's `open` request describes them (tic-tac-toe: `first`; Warcraft III: `map`, `seed`, `time_limit_seconds`, `mode`, ...) |
+| `player_slot_limits` | optional: `{"min": n, "max": n}` to narrow the game's own limits |
 | `timeout_seconds` | default `120` |
 
 - **Defaults and checks come from the env.** Settings left out get the game's defaults, and a setting the game
   doesn't take is refused (`bad_settings`) before any game exists.
 - **A run can override it,** through agent-env's per-run step overrides (`user_overrides.step_params.<step id>`). An
-  overridden `additional_settings` merges key by key into the task's (`{"additional_settings": {"seed": 7}}` changes
-  only the seed), and `player_slot_settings` replaces the task's.
-- **The opened lobby is kept** in the run's `metadata["game_lobby"]`.
+  overridden `game_settings` merges key by key into the task's (`{"game_settings": {"seed": 7}}` changes only the
+  seed), and `player_slot_limits` replaces the task's.
+- **The opened lobby, with its `lobby_id`, is kept** in the run's `metadata["game_lobby"]`. The other lobby steps send
+  that id.
 
-**`add_player_slot`** fills one slot:
+**`add_player_slot`** fills one player slot:
 
 | Field | |
 |---|---|
 | `env_id` | the game env |
-| `occupant` | `{"kind": "agent" \| "human" \| "ai", "name": ...}` |
-| `slot` | optional: the next free one by default |
-| `additional_settings` | optional: the game's settings for the slot |
-| `register` | agents only, default `true`: register the slot's address with the `deploy_agent` agent of that name. `false` only reserves the slot, for a player that connects on its own |
+| `player_id` | the game's name for the player slot (tic-tac-toe: `"x"` or `"o"`; Warcraft III: its player number, `"0"` to `"11"`) |
+| `player_kind` | `agent`, `human` or `ai` |
+| `player_name` | who plays it: for an agent, the `deploy_agent` agent; never for `ai` |
+| `game_settings` | optional: the game's settings for the player slot, as its card's `fill` request describes them |
+| `register` | agents only, default `true`: register the player slot's MCP address with the agent. `false` only reserves the slot, for a player that connects on its own |
 | `timeout_seconds` | default `60` |
 
-- **The agent is checked before the slot is taken,** so a missing agent leaves no slot behind.
+- **The agent is checked before the player slot is taken,** so a missing agent leaves no slot behind.
+- **The step reads the player slot's env card,** and registers each of its MCP interfaces with the agent.
 - **The agent must not already have the env's own address,** or it would play there instead. Deploy players with
   `"env_ids": []`.
-- **A person's link is logged** as `PLAY slot <n> (<name>): <url>`.
-- **Every slot is kept in the run's `metadata["game_slots"]`,** by name (or `slot-<n>` for an unnamed AI), with its
-  full `url` or `play_url`.
+- **A person's page is logged** as `PLAY player slot <player_id> (<name>): <url>`.
+- **Every player slot is kept in the run's `metadata["game_slots"]`,** by `player_id`: its `interfaces` with full URLs,
+  and for an agent the addresses `registered` with it.
 
 **`start_match`** closes the lobby, which creates the game. It takes `env_id` and `timeout_seconds` (default `900`).
-Put it after every `add_player_slot` of the game and before its players play. The closed lobby and the game's report
-are kept in `metadata["game_lobby"]`.
+Put it after every `add_player_slot` of the game and before its players play. The closed lobby is kept in
+`metadata["game_lobby"]`.
 
 ## Licenses: `urn:game:license/v1`
 
@@ -414,14 +470,12 @@ uv venv && uv pip install -e ".[dev]"
 
 ## Not done yet
 
-- **More of what games share,** as further parts of `AgentEnvGameEnv`: a start gate (the game begins when every player
-  has made its first move), holds, finish rules, per-slot results in the end-of-game summary, and a spectator timeline.
-  All exist for Warcraft III in [agentenv-wc3-plugin](https://github.com/earakely-scale/agentenv-wc3-plugin)'s
-  `agentenv_rts`.
-- **The lobby stops at close.** It doesn't show the game's start (who is ready). There's no `leave` either: a rerun
-  opens a new lobby.
-- **A slot's address isn't a secret.** Any client that can reach the env can use another player's path or header. A
-  per-slot token in `connect.headers` would close that.
+- **The match,** `urn:game:match/v1`: what happens after the lobby closes, such as the start gate, holds, finishing,
+  and each player's result and scores. It's being designed; Warcraft III has its own version in
+  [agentenv-wc3-plugin](https://github.com/earakely-scale/agentenv-wc3-plugin)'s `agentenv_rts`.
+- **Nothing calls `cancel` yet.** Its natural caller is cleanup for a run that ends before `start_match`.
+- **A player slot's address isn't a secret.** Any client that can reach the env can use another player's path. A
+  per-slot token in its `headers` would close that.
 
 ## License
 

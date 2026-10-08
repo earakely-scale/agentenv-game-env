@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentenv-game-env"
-version = "0.1.0"
+version = "0.2.0"
 description = "Game envs for AgentEnv: a lobby of player slots that agents, people and the game's own AI fill, a base class that serves it, and the task steps that fill it."
 readme = "README.md"
 license = "Apache-2.0"

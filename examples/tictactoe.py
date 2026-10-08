@@ -1,21 +1,26 @@
-"""Tic-tac-toe as a game env: two players, each an agent or the game's AI, put their marks on a 3x3 board in turn.
+"""Tic-tac-toe as a game env: two players, x and o, each an agent or the game's AI, put their marks on a 3x3 board in
+turn. A player slot's id is its mark.
 
-    python examples/tictactoe.py      # serves it on port 18765 (MCP_PORT); each player plays at /players/<name>/mcp
+    python examples/tictactoe.py      # serves it on port 18765 (MCP_PORT); each player plays at /players/<x|o>/mcp
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 from agentenv_protocol import environment_card, tool
+from pydantic import BaseModel, ConfigDict
 
 from agentenv_game import (
     AgentEnvGameEnv,
     Lobby,
-    OccupantKind,
+    LobbyError,
+    PlayerKind,
     PlayerSlot,
-    PlayerSlotSettings,
-    check_slot,
+    PlayerSlotLimits,
+    check_player_slot,
     create_game,
-    open_lobby,
+    player_slot_limits,
 )
 
 MARKS = ("x", "o")
@@ -24,35 +29,33 @@ LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4
 
 @environment_card(name="tictactoe")
 class TicTacToe(AgentEnvGameEnv):
+    class GameSettings(BaseModel):
+        model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
+        first: Literal["x", "o"] = "x"
+        """Who moves first."""
+
     board: list[str] = []
     turn, winner = "x", None
     players: dict[str, PlayerSlot] = {}
 
     # ---- the lobby: what this game takes ----
 
-    @open_lobby
-    def settings(self, additional_settings: dict, player_slot_settings: PlayerSlotSettings | None):
-        if set(additional_settings) - {"first"} or additional_settings.get("first", "x") not in MARKS:
-            raise ValueError('the settings are {"first": "x" or "o"}, who moves first')
-        if player_slot_settings is not None and player_slot_settings.max not in (None, 2):
+    @player_slot_limits
+    def two_players(self, game_settings: GameSettings, requested: PlayerSlotLimits) -> PlayerSlotLimits:
+        if requested.max not in (None, 2):
             raise ValueError("tic-tac-toe has two players")
-        return {"first": additional_settings.get("first", "x")}, PlayerSlotSettings(
-            min=2, max=2, additional_settings={"occupants": ["agent", "ai"], "factions": list(MARKS)})
+        return PlayerSlotLimits(min=2, max=2, player_kinds=[PlayerKind.AGENT, PlayerKind.AI])
 
-    @check_slot
-    def one_mark_each(self, slot: PlayerSlot, lobby: Lobby) -> None:
-        mark = slot.additional_settings.get("faction")
-        if set(slot.additional_settings) != {"faction"} or mark not in MARKS:
-            raise ValueError('a slot\'s settings are {"faction": "x" or "o"}')
-        if any(s.additional_settings["faction"] == mark for s in lobby.slots):
-            raise ValueError(f"{mark} is taken")
+    @check_player_slot
+    def a_mark(self, slot: PlayerSlot, lobby: Lobby) -> None:
+        if slot.player_id not in MARKS:
+            raise LobbyError("bad_slot", f'tic-tac-toe\'s player slots are "x" and "o", not {slot.player_id!r}')
 
     @create_game
-    async def new_game(self, lobby: Lobby) -> dict:
-        self.players = {s.additional_settings["faction"]: s for s in lobby.slots}
-        self.board, self.turn, self.winner = [" "] * 9, lobby.additional_settings["first"], None
+    async def new_game(self, lobby: Lobby) -> None:
+        self.players = {s.player_id: s for s in lobby.player_slots}
+        self.board, self.turn, self.winner = [" "] * 9, lobby.game_settings["first"], None
         self._ai_moves()
-        return {"first": lobby.additional_settings["first"]}
 
     # ---- the game: what each player can do ----
 
@@ -78,11 +81,11 @@ class TicTacToe(AgentEnvGameEnv):
             raise ValueError("the game has not started: its lobby is still open")
         slot = self.player()
         if slot is None:
-            raise ValueError("play at your slot's address, /players/<name>/mcp")
-        return slot.additional_settings["faction"]
+            raise ValueError("play at your player slot's address, /players/<x|o>/mcp")
+        return slot.player_id
 
     def _ai_moves(self) -> None:
-        while self.winner is None and self.players[self.turn].occupant.kind is OccupantKind.AI:
+        while self.winner is None and self.players[self.turn].player_kind is PlayerKind.AI:
             self._put(self.board.index(" "))
 
     def _put(self, cell: int) -> None:
