@@ -24,7 +24,6 @@ from pathlib import Path
 
 import serve
 
-DISPLAY = ":99"
 SINK = "broadcast"
 POLL_SECONDS = 5
 GONE_SECONDS = 60
@@ -93,13 +92,14 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def ffmpeg_command(size: str, fps: int, bitrate: str, targets: list[str], record: Path | None) -> list[str]:
+def ffmpeg_command(display: str, size: str, fps: int, bitrate: str, targets: list[str],
+                   record: Path | None) -> list[str]:
     """ffmpeg encoding the display and the sink's sound once, for the RTMP targets, the recording, or both: with
     more than one, the tee muxer keeps the others going when an RTMP leg fails."""
     rate = int(bitrate.rstrip("k"))
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-stats_period", "60",
            "-thread_queue_size", "512", "-f", "x11grab", "-video_size", size, "-framerate", str(fps),
-           "-draw_mouse", "0", "-i", DISPLAY,
+           "-draw_mouse", "0", "-i", display,
            "-thread_queue_size", "512", "-f", "pulse", "-i", f"{SINK}.monitor", "-map", "0:v", "-map", "1:a",
            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
            "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{2 * rate}k", "-g", str(2 * fps),
@@ -126,6 +126,22 @@ def remux(mkv: Path) -> Path | None:
         return None
     mkv.unlink()
     return mp4
+
+
+def start_xvfb(size: str) -> tuple[subprocess.Popen, str]:
+    """A virtual display on the first free display number, and that number: with --network host, X's sockets are the
+    host's, so another streamer on the machine may hold one already."""
+    width, height = size.split("x")
+    read, write = os.pipe()
+    proc = subprocess.Popen(["Xvfb", "-displayfd", str(write), "-screen", "0", f"{width}x{height}x24",
+                             "-nolisten", "tcp"], pass_fds=(write,))
+    os.close(write)
+    with os.fdopen(read) as chosen:
+        number = chosen.readline().strip()
+    if not number:
+        proc.kill()
+        raise RuntimeError("Xvfb did not start")
+    return proc, f":{number}"
 
 
 def start_pulseaudio(env: dict) -> subprocess.Popen:
@@ -175,10 +191,9 @@ def main() -> int:
     port = free_port()
     serve.serve(watch, port)
 
-    env = {**os.environ, "DISPLAY": DISPLAY, "XDG_RUNTIME_DIR": "/tmp/pulse-runtime"}
-    procs = [start_pulseaudio(env),
-             subprocess.Popen(["Xvfb", DISPLAY, "-screen", "0", f"{width}x{height}x24", "-nolisten", "tcp"])]
-    time.sleep(2)
+    xvfb, display = start_xvfb(args.size)
+    env = {**os.environ, "DISPLAY": display, "XDG_RUNTIME_DIR": "/tmp/pulse-runtime"}
+    procs = [xvfb, start_pulseaudio(env)]
     procs.append(subprocess.Popen(
         ["chromium", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--noerrdialogs",
          "--disable-infobars", "--hide-scrollbars", "--kiosk", "--window-position=0,0",
@@ -188,7 +203,7 @@ def main() -> int:
     time.sleep(8)
     stamp = f"{datetime.datetime.now(datetime.UTC):%Y%m%dT%H%M%SZ}"
     record = args.folder / f"stream-{stamp}.mkv" if args.record else None
-    ffmpeg = subprocess.Popen(ffmpeg_command(args.size, args.fps, args.bitrate, targets, record), env=env,
+    ffmpeg = subprocess.Popen(ffmpeg_command(display, args.size, args.fps, args.bitrate, targets, record), env=env,
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     threading.Thread(target=relay, args=(ffmpeg.stderr, secrets), daemon=True).start()
     procs.append(ffmpeg)

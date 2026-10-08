@@ -359,17 +359,18 @@ def test_the_streamer_ends_a_minute_after_the_env_stops_answering_and_with_its_e
 
 
 def test_the_streamer_encodes_once_for_one_leg_several_legs_or_only_the_recording():
-    one = stream.ffmpeg_command("1920x1080", 30, "4500k", ["rtmp://t/app/key"], None)
+    one = stream.ffmpeg_command(":3", "1920x1080", 30, "4500k", ["rtmp://t/app/key"], None)
     assert one[-3:] == ["-f", "flv", "rtmp://t/app/key"]
-    assert one[one.index("x11grab") - 1:one.index("x11grab") + 7] == [
-        "-f", "x11grab", "-video_size", "1920x1080", "-framerate", "30", "-draw_mouse", "0"]
+    assert one[one.index("x11grab") - 1:one.index("x11grab") + 9] == [
+        "-f", "x11grab", "-video_size", "1920x1080", "-framerate", "30", "-draw_mouse", "0", "-i", ":3"]
     assert one[one.index("-bufsize"):one.index("-bufsize") + 4] == ["-bufsize", "9000k", "-g", "60"]
-    legs = stream.ffmpeg_command("1280x720", 30, "3000k", ["rtmp://t/app/a", "rtmps://x:443/x/b"],
+    legs = stream.ffmpeg_command(":3", "1280x720", 30, "3000k", ["rtmp://t/app/a", "rtmps://x:443/x/b"],
                                  Path("/broadcast/stream.mkv"))
     assert legs[-5:] == ["-flags", "+global_header", "-f", "tee",
                          "[f=flv:onfail=ignore]rtmp://t/app/a|[f=flv:onfail=ignore]rtmps://x:443/x/b"
                          "|[f=matroska]/broadcast/stream.mkv"]
-    assert stream.ffmpeg_command("1280x720", 30, "3000k", [], Path("/b/s.mkv"))[-3:] == ["-f", "matroska", "/b/s.mkv"]
+    assert stream.ffmpeg_command(":3", "1280x720", 30, "3000k", [], Path("/b/s.mkv"))[-3:] == [
+        "-f", "matroska", "/b/s.mkv"]
 
 
 def test_the_streamer_relays_each_line_as_it_comes_without_the_stream_keys(capsys):
