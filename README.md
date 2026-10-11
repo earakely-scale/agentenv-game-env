@@ -27,10 +27,10 @@ this package gives every game env one way to say who plays it and how it is goin
   terms to accept), which must never be in its image, a task file or a reply.
 - **A broadcast** of a match to Twitch or X, or only recorded: the game's spectator view under an overlay of the
   players, the clock and the score. It reads only the lobby and the match, so it is the same for every game.
-- **Nine task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
+- **Ten task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
   `add_player_slot` and `close_lobby` open, fill and close the lobby of any game env built on it; `finish_match`
-  and `cancel_match` end its match, and `save_match_files` keeps its files; `start_broadcast` and `save_broadcast`
-  broadcast it and keep the video.
+  and `cancel_match` end its match, `grade_match` grades each player from its outcome and scores, and
+  `save_match_files` keeps its files; `start_broadcast` and `save_broadcast` broadcast it and keep the video.
 
 The same task steps then put players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent.
@@ -53,7 +53,7 @@ deploy_env
  │   └─ add_player_slot "1": agent p2, undead, team 1     (also after deploy_agent p2)
  ├─ deploy_agent p1, p2
  └─ close_lobby, after every add_player_slot: the game and its match are created
-     └─ prompt_agent p1, p2 ── finish_match: the match played out to its end ── grade
+     └─ prompt_agent p1, p2 ── finish_match: the match played out to its end ── grade_match
 ```
 
 **Contents:** [Install](#install) · [Try it: tic-tac-toe](#try-it-tic-tac-toe) ·
@@ -74,7 +74,7 @@ pip install "agentenv-game-env @ git+https://github.com/earakely-scale/agentenv-
   `agentenv-framework-protocol`, `mcp` and `pydantic`. In an env image, install the package with `--no-deps` beside
   them.
 - **The task steps** run in agent-env and need `agentenv-framework` too. Installed beside it, the package registers
-  them through agent-env's `agent_env.task_steps` entry points: `agent-env plugin list` shows `9 task steps`.
+  them through agent-env's `agent_env.task_steps` entry points: `agent-env plugin list` shows `10 task steps`.
 - **The broadcast** also needs Docker on the machine that runs agent-env.
 
 ## Try it: tic-tac-toe
@@ -264,14 +264,15 @@ agent against the game's AI:
   {"id": "close", "type": "close_lobby", "env_id": "tictactoe", "depends_on": ["slot-x", "slot-o"]},
   {"id": "play", "type": "prompt_agent", "agent_name": "alice", "depends_on": ["close"],
    "prompt": "You play tic-tac-toe through the tools. Win."},
-  {"id": "finish", "type": "finish_match", "env_id": "tictactoe", "depends_on": ["play"]}
+  {"id": "finish", "type": "finish_match", "env_id": "tictactoe", "depends_on": ["play"]},
+  {"id": "grade", "type": "grade_match", "env_id": "tictactoe", "depends_on": ["finish"]}
 ]
 ```
 
 - **The agent deploys with `"env_ids": []`.** `add_player_slot` gives it its player slot's MCP address, so it plays
   `x`, not the env's own address.
 - **A second agent in place of the AI** makes it model against model: deploy `bob` and give him player slot `"o"`.
-- **`finish_match` leaves the final match** in the run's `metadata["game_match"]`, for a grader to read.
+- **`grade_match` grades alice from the final match:** 1 for a win, 0.5 for a draw, 0 for a loss.
 - **`save_match_files` after `finish_match`** keeps the moves as a file artifact, and
   [`start_broadcast`](#broadcasting-a-match) after `close_lobby` streams the match.
 
@@ -332,6 +333,9 @@ match never changing. The game reports what only it knows in its `@match_report`
 | `progress` | its `Counter`s |
 | `outcomes` | `won`, `lost` or `drawn`, by `player_id`, for the players its rules have decided |
 | `scores` | `Score`s, by `player_id` |
+
+The outcomes and scores are all [`grade_match`](#grade_match) needs to grade the players: the first score is the game's
+main one, and a score's `better` (`higher` or `lower`) says which way it counts.
 
 ### In the game's tools and routes
 
@@ -585,6 +589,7 @@ If the game breaks while it starts or plays out, the method answers 500 with `ma
 | `finish_match` | plays the match out | after every `prompt_agent` of the match, before its grading | `7200` | `true` |
 | `cancel_match` | ends the match where it stands | in cleanup, or in place of `finish_match` | `60` | `true` |
 | `save_match_files` | keeps the match's files as file artifacts | after `finish_match` | `3600` | `false` |
+| `grade_match` | grades each player from the match's outcomes and scores ([`grade_match`](#grade_match)) | after `finish_match` | `60` | `true` |
 | `start_broadcast` | streams or records the match ([Broadcasting a match](#broadcasting-a-match)) | after `close_lobby`, before the `prompt_agent` steps | | `false` |
 | `save_broadcast` | keeps the broadcast's video | after `finish_match` | | `false` |
 
@@ -633,6 +638,42 @@ Keeps the game's files of its finished match, such as its replay or its recordin
 it, the game gives its default ones. Each file is streamed from the env, through a temporary file, into a `file`
 artifact named `<instance id>-<file name>`. What the game says it couldn't keep is logged.
 
+### `grade_match`
+
+Grades the players of the finished match from the match protocol alone: each player's outcome and scores, and the
+lobby's teams. A game built on this package needs no grader of its own.
+
+| Field | |
+|---|---|
+| `player_ids` | optional: the player slots to grade; every agent's by default |
+| `weights` | optional: a weight per criterion, merged into `{"outcome": 1}`. A criterion is `outcome` or the name of a score the game reports; `0` keeps it for the record only |
+| `verifier_id` | optional: the verification's name; the step's id by default |
+
+- **Each graded player gets its own verification** in the run's `metadata["verifications"]`, scored by agent-env's
+  weighted average as any verifier's is: under `verifier_id` when the task grades the game's one agent, else under
+  `<verifier_id>:<player_id>`.
+- **The outcome is a win 1, a draw 0.5, a loss 0.** A player the finished match left undecided, because nobody won by
+  its limit, draws.
+- **A weighted score counts as its share against the best opponent's.** The opponents are the players on other teams,
+  and the best is the highest score, or the lowest where lower is better. The share is mine / (mine + theirs), so an
+  even match is 0.5, and it stays between 0 and 1 for negative scores too. A score the player doesn't report, or no
+  opponent does, counts 0.
+- **Every score the game reports is kept,** counted or not: one weighed at 0, or not named, is a row for the record.
+- **Only a finished match is graded.** A cancelled or failed match has no outcome, and one still being played has none
+  yet: the step fails rather than read either as a loss. Weighing a score the game doesn't report fails it too.
+
+A Warcraft III ladder game the agent lost, graded with `"weights": {"score": 1}` (each row also has its `criterion`,
+in words):
+
+```json
+{"score": 0.116, "results": [
+  {"name": "outcome", "result": false, "score": 0.0, "weight": 1,
+   "evidence": "lost (the game's own easy orc AI won, at 1134 of 1800 seconds)"},
+  {"name": "score", "result": false, "score": 0.233, "weight": 1, "evidence": "18895 points vs 62221, 23% of the two"},
+  {"name": "units_killed", "result": null, "weight": 0, "evidence": "0 vs 47, 0% of the two"},
+  {"name": "army", "result": null, "weight": 0, "evidence": "0 vs 6495, 0% of the two"}]}
+```
+
 ### What the steps keep
 
 Everything goes in the run's `metadata`:
@@ -641,7 +682,8 @@ Everything goes in the run's `metadata`:
 |---|---|---|
 | `game_lobby` | `open_lobby`, `close_lobby` | the lobby, as opened and then as closed, with its `lobby_id` |
 | `game_slots` | `add_player_slot` | each player slot by `player_id`: its `interfaces` with full URLs, and for an agent the addresses `registered` with it |
-| `game_match` | `finish_match`, `cancel_match` | the final match |
+| `game_match` | `finish_match`, `cancel_match`, `grade_match` | the final match |
+| `verifications` | `grade_match` | agent-env's verifier record for each graded player: `results`, a row per criterion, and its `score` |
 | `match_files` | `save_match_files` | by the step's id: each file's `name`, `kind`, `artifact_id`, `version` and `bytes` |
 | `game_license` | `add_license` | `{"installed": [...]}`: the names of the parts the game was given, never their contents |
 | `broadcasts` | `start_broadcast`, `save_broadcast` | by the `start_broadcast` step's id: its streamer and, once kept, its `videos` (`name`, `artifact_id`, `version`, `bytes`) |
