@@ -1,7 +1,8 @@
 """A game env's task steps: `add_license` gives the game the license it lacks, from agent-env's secret store;
 `open_lobby` opens its lobby with the game's settings, `add_player_slot` fills one player slot and gives an agent its
 slot's MCP address, read from the slot's env card, and `close_lobby` closes the lobby, which creates the game and its
-match; `finish_match` plays the match out once its agents have stopped, and `cancel_match` ends it where it stands."""
+match; `await_match` waits for a match to end on its own, `finish_match` plays it out once its agents have stopped,
+and `cancel_match` ends it where it stands."""
 
 from __future__ import annotations
 
@@ -9,10 +10,12 @@ import asyncio
 import json
 import logging
 import tempfile
+import time
 import uuid
 from functools import partial
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlencode
 
 import httpx
 from agent_env.a2a_agent.a2a_agent import A2AAgent
@@ -29,7 +32,7 @@ from pydantic import ValidationError
 
 from .license import LICENSE, LicenseItem, LicenseKind
 from .lobby import LOBBY, PlayerKind, PlayerSlot, PlayerSlotLimits, SlotRequest
-from .match import MATCH
+from .match import FINAL, MATCH
 
 PAGE = "http"
 """A player slot's interface for a person: a page to open."""
@@ -155,8 +158,8 @@ class AddPlayerSlotTaskStep(TaskStep):
     `game_settings` the game's settings for it (WC3: faction, team, ai_level). The step reads the player slot's env
     card. An agent's slot is registered with the deploy_agent agent `player_name`, each of the card's MCP interfaces,
     so its calls play this slot (deploy it with `"env_ids": []`); `register: false` only reserves the slot, for a player
-    that connects on its own. A human's page is logged. Each player slot is kept in the run's
-    `metadata["game_slots"]`, by its player_id."""
+    that connects on its own. A human's page is logged, with the slot's headers (their secret) in its fragment for the
+    page to send. Each player slot is kept in the run's `metadata["game_slots"]`, by its player_id."""
 
     type: ClassVar[str] = "add_player_slot"
     entity_refs = (EntityRef.env("env_id"),)
@@ -210,8 +213,9 @@ class AddPlayerSlotTaskStep(TaskStep):
                                         for path in mcp]
                 log.info("add_player_slot: %s plays player slot %s at %s", name, slot.player_id,
                          ", ".join(record["registered"]))
+            secret = f"#{urlencode(slot.headers)}" if slot.headers else ""
             for page in (i["url"] for i in record["interfaces"] if i.get("transport") == PAGE):
-                log.warning("PLAY player slot %s (%s): %s", slot.player_id, name, page)
+                log.warning("PLAY player slot %s (%s): %s%s", slot.player_id, name, page, secret)
         else:
             log.info("add_player_slot: the game's AI plays player slot %s", slot.player_id)
         context.metadata.setdefault("game_slots", {})[slot.player_id] = record
@@ -303,6 +307,59 @@ class CancelMatchTaskStep(_EndMatchTaskStep):
     entity_refs = (EntityRef.env("env_id"),)
     method = "cancel"
     default_timeout = 60
+
+
+class AwaitMatchTaskStep(TaskStep):
+    """Wait until a deployed game env's match ends on its own, as one a person plays does, where no prompt_agent step
+    lasts until its end: put it after close_lobby, and finish_match after it has nothing left to do. The match is read
+    every `poll_seconds`, and a read that fails (an env busy with a turn) is tried again; the step fails once
+    `timeout_seconds` pass first. The final match is kept in the run's `metadata["game_match"]`."""
+
+    type: ClassVar[str] = "await_match"
+    entity_refs = (EntityRef.env("env_id"),)
+
+    def __init__(self, id: str, version: int | None, env_id: str, timeout_seconds: int = 36000,
+                 poll_seconds: float = 10, depends_on: list | None = None, fail_task_on_error: bool = True):
+        super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
+        self.env_id, self.timeout_seconds, self.poll_seconds = env_id, timeout_seconds, poll_seconds
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "env_id": self.env_id, "timeout_seconds": self.timeout_seconds,
+                "poll_seconds": self.poll_seconds}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> AwaitMatchTaskStep:
+        return cls(**{**cls._base_from_dict(data), "fail_task_on_error": data.get("fail_task_on_error", True)},
+                   env_id=data["env_id"], **{k: data[k] for k in ("timeout_seconds", "poll_seconds") if k in data})
+
+    async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        deployed = _deployed(context, self.env_id)
+        ours = (context.metadata.get("game_lobby") or {}).get("lobby_id")
+        deadline, progress, failing = time.monotonic() + self.timeout_seconds, None, False
+        while True:
+            try:
+                match = await _invoke(deployed, MATCH, "get", {}, 60)
+            except (RuntimeError, httpx.HTTPError) as e:
+                if not failing:
+                    log.warning("await_match: reading %s's match failed (%s); trying again", self.env_id, e)
+                failing, match = True, None
+            else:
+                failing = False
+                if match is None or (ours and match["lobby_id"] != ours):
+                    raise RuntimeError(f"env {self.env_id!r} holds no match of this run's lobby {ours}")
+                if match["status"] in FINAL:
+                    break
+                if (clock := next(iter(match.get("progress") or ()), None)) != progress:
+                    progress = clock
+                    log.info("await_match: %s's match is %s, %s %s of %s", self.env_id, match["status"],
+                             (clock or {}).get("unit", ""), (clock or {}).get("value"), (clock or {}).get("limit"))
+            if (left := deadline - time.monotonic()) <= 0:
+                raise TimeoutError(f"env {self.env_id!r}'s match hasn't ended after {self.timeout_seconds} s")
+            await asyncio.sleep(min(self.poll_seconds, left))
+        context.metadata["game_match"] = match
+        log.info("await_match: %s's match is %s%s", self.env_id, match["status"],
+                 f" ({match['status_detail']})" if match.get("status_detail") else "")
+        return context
 
 
 class SaveMatchFilesTaskStep(TaskStep):

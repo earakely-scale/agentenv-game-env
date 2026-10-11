@@ -1,5 +1,6 @@
 """The lobby and match steps against the served example game and a fake A2A agent."""
 
+import asyncio
 import json
 import logging
 
@@ -7,13 +8,16 @@ import pytest
 from agent_env.artifact import FileArtifact
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
+from agentenv_protocol import client
 from conftest import FakeAgent, deployed, serving
 from test_lobby import Arena
 from test_match import Race
 from tictactoe import TicTacToe
 
+from agentenv_game import LOBBY, player_slot_headers
 from agentenv_game.steps import (
     AddPlayerSlotTaskStep,
+    AwaitMatchTaskStep,
     CancelMatchTaskStep,
     CloseLobbyTaskStep,
     FinishMatchTaskStep,
@@ -97,6 +101,56 @@ async def test_a_human_gets_the_page_their_slot_card_gives():
     slot = context.metadata["game_slots"]["dana"]
     assert slot["interfaces"] == [{"url": env.environment_url + "/players/dana/play", "transport": "http"}]
     assert slot["game_settings"] == {"faction": "elf", "label": None}
+
+
+class Guarded(Arena):
+    @player_slot_headers
+    def secret(self, slot):
+        return {"x-token": f"t-{slot.player_id}"}
+
+
+async def test_a_slots_headers_reach_only_the_fill_that_took_it_its_agent_and_its_persons_page(caplog):
+    game, alice = Guarded(), FakeAgent()
+    async with deployed(game) as env, serving(alice.app) as agent_url:
+        context = TaskStepContext(deployed_envs=[env], deployed_agents=[alice.deployed(agent_url, "alice")])
+        await opening().execute(context)
+        with caplog.at_level(logging.WARNING):
+            await add("slot-d", "dana", "human", "dana", game_settings={"faction": "elf"}).execute(context)
+        await add("slot-a", "ann", "agent", "alice", game_settings={"faction": "orc"}).execute(context)
+        lobby = await client.invoke_extension(env.environment_url, env.environment_card, LOBBY, {}, method="get")
+        await CloseLobbyTaskStep(id="close", version=None, env_id="tictactoe").execute(context)
+    slots = context.metadata["game_slots"]
+    assert (slots["dana"]["headers"], slots["ann"]["headers"]) == ({"x-token": "t-dana"}, {"x-token": "t-ann"})
+    assert f"PLAY player slot dana (dana): {env.environment_url}/players/dana/play#x-token=t-dana" in caplog.text
+    assert alice.servers["arena"]["headers"] == {"x-token": "t-ann"}
+    assert [s["player_id"] for s in lobby["player_slots"]] == ["dana", "ann"]
+    assert not any("headers" in s for s in [*lobby["player_slots"], *context.metadata["game_lobby"]["player_slots"]])
+
+
+async def test_await_match_waits_for_the_match_to_end_on_its_own():
+    game = Race()
+    async with deployed(game) as env:
+        context = TaskStepContext(deployed_envs=[env])
+        await opening(game_settings={"limit": 4}).execute(context)
+        await add("slot-c", "c", "ai").execute(context)
+        await CloseLobbyTaskStep(id="close", version=None, env_id="tictactoe").execute(context)
+
+        async def play():
+            for _ in range(4):
+                await asyncio.sleep(0.05)
+                game.tick()
+
+        playing = asyncio.create_task(play())
+        await AwaitMatchTaskStep(id="await", version=None, env_id="tictactoe", poll_seconds=0.02).execute(context)
+        await playing
+        assert (context.metadata["game_match"]["status"], context.metadata["game_match"]["status_detail"]) == (
+            "finished", "out of time")
+        await opening().execute(context)
+        await add("slot-c", "c", "ai").execute(context)
+        await CloseLobbyTaskStep(id="close", version=None, env_id="tictactoe").execute(context)
+        with pytest.raises(TimeoutError, match="hasn't ended after 0.1 s"):
+            await AwaitMatchTaskStep(id="await", version=None, env_id="tictactoe", timeout_seconds=0.1,
+                                     poll_seconds=0.02).execute(context)
 
 
 async def test_open_lobby_opens_the_lobby_with_the_games_settings_and_a_runs_overrides():

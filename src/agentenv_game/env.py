@@ -3,9 +3,9 @@
 card, and tells each request which player slot it plays. A game declares its settings as pydantic models,
 `GameSettings` for the lobby's and `PlayerSlotSettings` for each player slot's, and marks its parts with decorators,
 as agentenv-protocol's data plane marks `@reset_data`: `@create_game` (required), `@player_slot_limits`,
-`@check_player_slot`, `@player_slot_card` and `@player_teams` for the lobby; `@match_report`, `@begin_game`,
-`@play_out`, `@spectator_card` and `@match_files` for the match; and for a licensed game `@license_needs` with
-`@install_license`."""
+`@check_player_slot`, `@player_slot_card`, `@player_slot_headers` and `@player_teams` for the lobby;
+`@match_report`, `@begin_game`, `@play_out`, `@spectator_card` and `@match_files` for the match; and for a licensed
+game `@license_needs` with `@install_license`."""
 
 from __future__ import annotations
 
@@ -50,7 +50,8 @@ from .routing import PLAYERS, SPECTATORS, PlayerPaths, current_player, current_s
 log = logging.getLogger(__name__)
 _HOOK = "_agentenv_game_hook"
 HOOKS = {"player_slot_limits": (2, False), "check_player_slot": (2, False), "create_game": (1, True),
-         "player_slot_card": (1, False), "player_teams": (1, False), "match_report": (0, False),
+         "player_slot_card": (1, False), "player_slot_headers": (1, False), "player_teams": (1, False),
+         "match_report": (0, False),
          "begin_game": (0, True), "play_out": (0, True), "spectator_card": (0, False), "match_files": (1, True),
          "license_needs": (0, False), "install_license": (1, False)}
 """Each decorator's method: its parameters after self, and whether it is a coroutine."""
@@ -148,6 +149,13 @@ def player_slot_card(fn: Callable) -> Callable:
     return _mark(fn, "player_slot_card")
 
 
+def player_slot_headers(fn: Callable) -> Callable:
+    """The method that gives an agent or human player slot its secret, `(slot)`: the headers its player sends (a
+    person's play token, which their page sends), as a dict of strings. Only the fill that takes the slot replies with
+    them; every other lobby reply leaves them out. The game checks them itself."""
+    return _mark(fn, "player_slot_headers")
+
+
 def player_teams(fn: Callable) -> Callable:
     """The method that puts the lobby's player slots in teams, `(lobby)`, as PlayerTeams: allies on one team, every
     player slot on exactly one. Read as player slots fill, so fixed when the lobby closes. Without it, each player
@@ -212,6 +220,18 @@ def _errors(e: ValidationError, prefix: str = "") -> str:
 
 def _dump(settings: BaseModel | dict) -> dict:
     return settings.model_dump(mode="json") if isinstance(settings, BaseModel) else settings
+
+
+def _headers(given: Any) -> dict[str, str]:
+    if not (isinstance(given, dict) and all(isinstance(k, str) and k and isinstance(v, str) for k, v in given.items())):
+        raise TypeError(f"@player_slot_headers returns a dict of strings, not {given!r}")
+    return dict(given)
+
+
+def _public(lobby: Lobby) -> dict:
+    """The lobby as its replies give it: without the player slots' headers, which only the fill that took each slot
+    replies with."""
+    return lobby.model_dump(mode="json", exclude_none=True, exclude={"player_slots": {"__all__": {"headers"}}})
 
 
 def _strings(params: dict, method: str, *names: str, required: tuple[str, ...] = ()) -> dict:
@@ -348,6 +368,8 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
                 raise GameError("bad_settings", str(e)) from e
         if slot.player_kind is not PlayerKind.AI:
             slot.environment_url = f"{PLAYERS}/{slot.player_id}"
+            if secret := self._hooks().get("player_slot_headers"):
+                slot.headers = _headers(secret(slot))
         lobby.add(slot)
         lobby.player_teams = self._teams(lobby)
         return slot
@@ -466,7 +488,8 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
         for player_id, state in match.player_states.items():
             outcome = report.outcomes.get(player_id) if begun else None
             now = PlayerStatus(outcome) if outcome else PlayerStatus.UNDECIDED if status in FINAL else state.status
-            players[player_id] = PlayerState(status=now, scores=report.scores.get(player_id))
+            players[player_id] = PlayerState(status=now, scores=report.scores.get(player_id),
+                                             moves=report.moves.get(player_id))
         return Match(lobby_id=match.lobby_id, status=status,
                      status_detail=detail or report.status_detail or match.status_detail,
                      progress=report.progress, player_states=players, spectator_url=match.spectator_url)
@@ -616,7 +639,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
     # ---- the routes: each protocol's get at its endpoint, its other methods beneath it ----
 
     async def _lobby_get(self, params: dict) -> dict:
-        return self.lobby.model_dump(mode="json", exclude_none=True)
+        return _public(self.lobby)
 
     async def _open(self, params: dict) -> dict:
         if unknown := sorted(set(params) - {"game_settings", "player_slot_limits"}):
@@ -628,8 +651,7 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
             raise GameError("bad_request", f"player_slot_limits: {e}") from e
         except ValidationError as e:
             raise GameError("bad_settings", _errors(e, "player_slot_limits")) from e
-        lobby = self.new_lobby(params.get("game_settings"), limits)
-        return lobby.model_dump(mode="json", exclude_none=True)
+        return _public(self.new_lobby(params.get("game_settings"), limits))
 
     async def _fill(self, params: dict) -> dict:
         try:
@@ -640,12 +662,10 @@ class AgentEnvGameEnv(AgentEnvEnvironment):
         return self.fill_slot(request).model_dump(mode="json", exclude_none=True)
 
     async def _close(self, params: dict) -> dict:
-        lobby = await self.close_lobby(_strings(params, "close", "lobby_id").get("lobby_id"))
-        return lobby.model_dump(mode="json", exclude_none=True)
+        return _public(await self.close_lobby(_strings(params, "close", "lobby_id").get("lobby_id")))
 
     async def _cancel(self, params: dict) -> dict:
-        return self.cancel_lobby(_strings(params, "cancel", "lobby_id").get("lobby_id")).model_dump(
-            mode="json", exclude_none=True)
+        return _public(self.cancel_lobby(_strings(params, "cancel", "lobby_id").get("lobby_id")))
 
     async def _match_get(self, params: dict) -> dict | None:
         match = self.match

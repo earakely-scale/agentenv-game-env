@@ -27,10 +27,11 @@ this package gives every game env one way to say who plays it and how it is goin
   terms to accept), which must never be in its image, a task file or a reply.
 - **A broadcast** of a match to Twitch or X, or only recorded: the game's spectator view under an overlay of the
   players, the clock and the score. It reads only the lobby and the match, so it is the same for every game.
-- **Ten task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
-  `add_player_slot` and `close_lobby` open, fill and close the lobby of any game env built on it; `finish_match`
-  and `cancel_match` end its match, `grade_match` grades each player from its outcome and scores, and
-  `save_match_files` keeps its files; `start_broadcast` and `save_broadcast` broadcast it and keep the video.
+- **Eleven task steps**: `add_license` gives a game its license from agent-env's secret store; `open_lobby`,
+  `add_player_slot` and `close_lobby` open, fill and close the lobby of any game env built on it; `await_match`
+  waits for its match to end on its own, `finish_match` and `cancel_match` end it, `grade_match` grades each player
+  from its outcome, scores and moves, and `save_match_files` keeps its files; `start_broadcast` and `save_broadcast`
+  broadcast it and keep the video.
 
 The same task steps then put players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent.
@@ -74,7 +75,7 @@ pip install "agentenv-game-env @ git+https://github.com/earakely-scale/agentenv-
   `agentenv-framework-protocol`, `mcp` and `pydantic`. In an env image, install the package with `--no-deps` beside
   them.
 - **The task steps** run in agent-env and need `agentenv-framework` too. Installed beside it, the package registers
-  them through agent-env's `agent_env.task_steps` entry points: `agent-env plugin list` shows `10 task steps`.
+  them through agent-env's `agent_env.task_steps` entry points: `agent-env plugin list` shows `11 task steps`.
 - **The broadcast** also needs Docker on the machine that runs agent-env.
 
 ## Try it: tic-tac-toe
@@ -305,6 +306,7 @@ Mark them with decorators, the way agentenv-protocol's data plane marks `@reset_
 | `@player_slot_limits` | when a lobby opens | `game_settings` (its `GameSettings`), `requested` (the opener's `PlayerSlotLimits`) | the `PlayerSlotLimits` the lobby keeps | the lobby keeps the request |
 | `@check_player_slot` | before the lobby takes a player slot | `slot`, `lobby` | nothing; raise to refuse | only the lobby's checks and the settings models |
 | `@player_slot_card` | for an agent's or a person's player slot | `slot` | its `EnvironmentCard` | one MCP interface |
+| `@player_slot_headers` | as an agent's or a person's player slot fills | `slot` | its secret: the headers its player sends, as a dict of strings (a person's play token) | no headers |
 | `@player_teams` | as player slots fill | `lobby` | its `PlayerTeam`s, every player slot on exactly one | a team per player slot |
 | `@match_report` | on every read of the match, until it's final | nothing | a `MatchReport` | the match has only its lifecycle |
 | `@begin_game`, async | once, as the match starts | nothing | nothing; a failure fails the match | the match starts as the lobby closes |
@@ -315,6 +317,9 @@ Mark them with decorators, the way agentenv-protocol's data plane marks `@reset_
 | `@install_license` | when parts arrive | `parts`: a `LicenseParts` | nothing; raise `ValueError` to refuse a part | comes with `@license_needs` |
 
 - **One method per decorator, across the class and its bases.** The method name is yours.
+- **A player slot's headers are its player's secret.** Only the `fill` that took the slot replies with them, and
+  `add_player_slot` gives them to the agent with its address, or puts them in a person's page link; every other lobby
+  reply leaves them out. The game checks them itself, in its tools and routes.
 - **A `ValueError` from `@player_slot_limits` or `@check_player_slot` is the caller's `bad_settings`,** with your
   message. Raise a `GameError(code, message)` to give another code: `bad_slot` for a `player_id` the game doesn't have.
 - **The marks are checked before the env serves:** one per decorator, `@create_game` present, `@license_needs` and
@@ -333,9 +338,12 @@ match never changing. The game reports what only it knows in its `@match_report`
 | `progress` | its `Counter`s |
 | `outcomes` | `won`, `lost` or `drawn`, by `player_id`, for the players its rules have decided |
 | `scores` | `Score`s, by `player_id` |
+| `moves` | `Moves`, by `player_id`, for a game that counts them: how much each player took part, in the game's own unit |
 
 The outcomes and scores are all [`grade_match`](#grade_match) needs to grade the players: the first score is the game's
-main one, and a score's `better` (`higher` or `lower`) says which way it counts.
+main one, and a score's `better` (`higher` or `lower`) says which way it counts. With moves, it also zeroes a player
+that made none, or that missed more of them than a task allows: Warcraft III counts the orders each player sent, and a
+turn-based game the turns each player ended itself (`made`) and those the game ended for it (`missed`).
 
 ### In the game's tools and routes
 
@@ -399,9 +407,12 @@ JSON Schema, and `open`'s and `fill`'s include the game's own settings models, s
 |---|---|---|---|
 | `open` | `POST /agentenv/ext/lobby/open` | `{"game_settings": {...}, "player_slot_limits": {...}}`, both optional | the lobby |
 | `get` | `GET /agentenv/ext/lobby` | | the lobby |
-| `fill` | `POST /agentenv/ext/lobby/fill` | `{"player_id": ..., "player_kind": ..., "player_name": ..., "game_settings": {...}, "lobby_id": ...}`; `player_name`, `game_settings` and `lobby_id` optional | the filled player slot |
+| `fill` | `POST /agentenv/ext/lobby/fill` | `{"player_id": ..., "player_kind": ..., "player_name": ..., "game_settings": {...}, "lobby_id": ...}`; `player_name`, `game_settings` and `lobby_id` optional | the filled player slot, with its `headers` |
 | `close` | `POST /agentenv/ext/lobby/close` | `{"lobby_id": ...}`, optional | the lobby |
 | `cancel` | `POST /agentenv/ext/lobby/cancel` | `{"lobby_id": ...}`, optional | the lobby |
+
+**Only `fill` replies with a player slot's `headers`,** its player's secret (`@player_slot_headers`); the lobby in
+every other reply leaves them out.
 
 **A `lobby_id` guards against a lobby opened since.** `fill`, `close` and `cancel` refuse a `lobby_id` that isn't the
 current lobby's (`lobby_replaced`). The task steps always send the one `open_lobby` opened.
@@ -546,7 +557,8 @@ Advertised on the env's card, in the `urn:game:match/v1` extension's `params.met
 |---|---|
 | `Match` | `lobby_id`: the lobby it was created from; one match per lobby, so it names the match too. `status`: `MatchStatus`. `status_detail`. `progress`: `Counter`s, outermost first. `player_states`: a `PlayerState` for each of the lobby's player slots, by `player_id`. `spectator_url`: `/spectators`, in a game with a spectator view. |
 | `Counter` | `name`. `unit`: free text; `seconds` (game time), `wall_seconds` and `turns` are documented. `value`: from 0. `limit`: ends this scope, and the first counter's ends the match. `rate`: units per wall-clock second while it runs on its own; `0` stopped, absent only as players act. |
-| `PlayerState` | `status`: `PlayerStatus`. `scores`: `Score`s, the first the game's main score. |
+| `PlayerState` | `status`: `PlayerStatus`. `scores`: `Score`s, the first the game's main score. `moves`: `Moves`, for a game that counts them. |
+| `Moves` | `made`: the moves the player made, in the game's own unit (an order, a turn). `missed`: those the game went on without, in the same unit (a turn the game ended for it). |
 | `Score` | `name`: the same name is the same measure on every player that has it. `value`. `better`: `higher` or `lower`. `unit`. |
 
 A Total War campaign would report `[{"name": "campaign", "unit": "turns", "value": 12, "limit": 100}, {"name":
@@ -586,6 +598,7 @@ If the game breaks while it starts or plays out, the method answers 500 with `ma
 | `open_lobby` | opens the lobby with the game's settings | after `deploy_env` | `120` | `true` |
 | `add_player_slot` | fills one player slot, and gives an agent its address | after `open_lobby` and the agent's `deploy_agent` | `60` | `true` |
 | `close_lobby` | closes the lobby, which creates the game and its match | after every `add_player_slot`, before the players play | `900` | `true` |
+| `await_match` | waits for the match to end on its own ([`await_match`](#await_match)) | after `close_lobby`, in a match a person plays | `36000` | `true` |
 | `finish_match` | plays the match out | after every `prompt_agent` of the match, before its grading | `7200` | `true` |
 | `cancel_match` | ends the match where it stands | in cleanup, or in place of `finish_match` | `60` | `true` |
 | `save_match_files` | keeps the match's files as file artifacts | after `finish_match` | `3600` | `false` |
@@ -625,12 +638,21 @@ of `timeout_seconds` and `fail_task_on_error` are in the table.
 - **The step reads the player slot's env card,** and registers each of its MCP interfaces with the agent.
 - **The agent must not already have the env's own address,** or it would play there instead. Deploy players with
   `"env_ids": []`.
-- **A person's page is logged** as `PLAY player slot <player_id> (<name>): <url>`.
+- **A person's page is logged** as `PLAY player slot <player_id> (<name>): <url>`, with the slot's headers, if the
+  game gives it any, in the URL's fragment (`#x-token=...`), for the page to read and send. A fragment never reaches
+  a server.
 
 ### `close_lobby`, `finish_match` and `cancel_match`
 
 They take nothing more, and do what the protocols' `close`, `finish` and `cancel` do. `finish_match`'s long default
 timeout covers a realtime game's remaining time.
+
+### `await_match`
+
+Waits until the match ends on its own, as one a person plays does, where no `prompt_agent` step lasts until its end.
+It reads the match every `poll_seconds` (default `10`) and tries again when a read fails, as it can while a game
+takes a turn; it fails once `timeout_seconds` pass first. The final match goes in the run's `metadata["game_match"]`,
+and a `finish_match` after it has nothing left to do.
 
 ### `save_match_files`
 
@@ -647,6 +669,7 @@ lobby's teams. A game built on this package needs no grader of its own.
 |---|---|
 | `player_ids` | optional: the player slots to grade; every agent's by default |
 | `weights` | optional: a weight per criterion, merged into `{"outcome": 1}`. A criterion is `outcome` or the name of a score the game reports; `0` keeps it for the record only |
+| `max_missed` | optional: the share of its moves, `0` to `1`, a player may miss before it scores 0; for a game that counts moves |
 | `verifier_id` | optional: the verification's name; the step's id by default |
 
 - **Each graded player gets its own verification** in the run's `metadata["verifications"]`, scored by agent-env's
@@ -659,6 +682,8 @@ lobby's teams. A game built on this package needs no grader of its own.
   even match is 0.5, and it stays between 0 and 1 for negative scores too. A score the player doesn't report, or no
   opponent does, counts 0.
 - **Every score the game reports is kept,** counted or not: one weighed at 0, or not named, is a row for the record.
+- **A game that counts its players' moves gates the grade on them.** A player that made none scores 0, and so does
+  one that missed more than `max_missed` of its moves: gate rows of weight -100, which outweigh every criterion.
 - **Only a finished match is graded.** A cancelled or failed match has no outcome, and one still being played has none
   yet: the step fails rather than read either as a loss. Weighing a score the game doesn't report fails it too.
 
@@ -682,7 +707,7 @@ Everything goes in the run's `metadata`:
 |---|---|---|
 | `game_lobby` | `open_lobby`, `close_lobby` | the lobby, as opened and then as closed, with its `lobby_id` |
 | `game_slots` | `add_player_slot` | each player slot by `player_id`: its `interfaces` with full URLs, and for an agent the addresses `registered` with it |
-| `game_match` | `finish_match`, `cancel_match`, `grade_match` | the final match |
+| `game_match` | `await_match`, `finish_match`, `cancel_match`, `grade_match` | the final match |
 | `verifications` | `grade_match` | agent-env's verifier record for each graded player: `results`, a row per criterion, and its `score` |
 | `match_files` | `save_match_files` | by the step's id: each file's `name`, `kind`, `artifact_id`, `version` and `bytes` |
 | `game_license` | `add_license` | `{"installed": [...]}`: the names of the parts the game was given, never their contents |
@@ -895,8 +920,10 @@ The tests need no Docker, no model and no remote service.
   directly, without the request headers a remote sandbox can require; it is meant for an env in a `local` sandbox.
 - **Nothing calls the lobby's `cancel` yet.** Its natural caller is cleanup for a run that ends before `close_lobby`.
 - **The harness can't pause a match.** Only a game pauses its own.
-- **A player slot's address isn't a secret.** Any client that can reach the env can use another player's path. A
-  per-slot token in its `headers` would close that.
+- **A player slot's address isn't a secret unless the game makes it one.** Any client that can reach the env can use
+  another player's path. A game can give each slot headers (`@player_slot_headers`) and check them in its tools, but
+  the SDK doesn't check them on the slot's path yet. The lobby's own methods, like the other protocols', are the
+  harness's, and any client that reaches the env can call them.
 
 ## License
 

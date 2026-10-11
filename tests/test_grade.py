@@ -114,6 +114,24 @@ def test_a_score_the_player_or_its_opponents_dont_report_counts_0():
         grader(weights={"kills": 1}).grade(match(**states), DUEL)
 
 
+def test_a_game_that_counts_moves_gates_the_grade_on_them():
+    states = {"0": {**state("won"), "moves": {"made": 0, "missed": 0}}, "1": state("lost")}
+    rows = grader().grade(match(**states), DUEL)["grade"]
+    assert rows[-1] == {"name": "played", "criterion": "the player made a move", "result": False, "weight": -100,
+                        "evidence": "made 0, missed 0"} and score_of(rows) == 0.0
+    states["0"]["moves"] = {"made": 9, "missed": 1}
+    rows = grader(max_missed=0.1).grade(match(**states), DUEL)["grade"]
+    assert [(r["name"], r["result"]) for r in rows[-2:]] == [("played", True), ("missed", True)]
+    assert rows[-1]["criterion"] == "missed at most 10% of its moves" and score_of(rows) == 1.0
+    states["0"]["moves"] = {"made": 8, "missed": 2}
+    assert score_of(grader(max_missed=0.1).grade(match(**states), DUEL)["grade"]) == 0.0
+    with pytest.raises(RuntimeError, match="max_missed needs the game's count of moves"):
+        grader(max_missed=0.1).grade(match(**{"0": state("won"), "1": state("lost")}), DUEL)
+    for given in (1.5, -0.1, True, "0.1"):
+        with pytest.raises(ValueError, match="max_missed is a share"):
+            grader(max_missed=given)
+
+
 def test_a_match_that_didnt_finish_has_no_grade():
     states = {"0": state("undecided"), "1": state("undecided")}
     with pytest.raises(RuntimeError, match="no outcome to grade, the match cancelled: the harness ended it"):
@@ -128,8 +146,9 @@ def test_the_step_loads_from_task_json_and_checks_its_fields():
     step = get_task_step_registry()["grade_match"].from_dict(
         {"id": "grade", "type": "grade_match", "env_id": "wc3", "player_ids": ["0"], "weights": {"score": 0.5},
          "depends_on": ["finish"]})
-    assert {k: step.to_dict()[k] for k in ("env_id", "player_ids", "weights", "verifier_id", "timeout_seconds")} == {
-        "env_id": "wc3", "player_ids": ["0"], "weights": {"score": 0.5}, "verifier_id": "grade",
+    assert {k: step.to_dict()[k] for k in ("env_id", "player_ids", "weights", "max_missed", "verifier_id",
+                                          "timeout_seconds")} == {
+        "env_id": "wc3", "player_ids": ["0"], "weights": {"score": 0.5}, "max_missed": None, "verifier_id": "grade",
         "timeout_seconds": 60}
     assert step.criteria() == {"outcome": 1, "score": 0.5} and step.entity_refs and step.fail_task_on_error
     with pytest.raises(ValueError, match="needs a criterion with a weight above 0"):
@@ -177,6 +196,7 @@ async def test_grade_match_after_finish_match_with_a_weighted_score_and_only_the
         await game.step("a")
         await FinishMatchTaskStep(id="finish", version=None, env_id="tictactoe").execute(context)
         await grader(weights={"distance": 1}).execute(context)
+        await GradeMatchTaskStep(id="strict", version=None, env_id="tictactoe", max_missed=0.5).execute(context)
         ours = context.metadata["game_lobby"]["lobby_id"]
         context.metadata["game_lobby"] = {"lobby_id": "lb-elsewhere"}
         with pytest.raises(RuntimeError, match=f"match is lobby {ours}'s, not this run's, lb-elsewhere"):
@@ -184,7 +204,11 @@ async def test_grade_match_after_finish_match_with_a_weighted_score_and_only_the
         game.new_lobby()
         with pytest.raises(RuntimeError, match="has no match; grade it after close_lobby and finish_match"):
             await grader().execute(context)
-    [outcome, distance] = context.metadata["verifications"]["grade"]["results"]
+    [outcome, distance, played] = context.metadata["verifications"]["grade"]["results"]
     assert outcome["evidence"] == "lost (c won, at 6 of 10 ticks)"
     assert (distance["score"], distance["evidence"]) == (0.4, "2 vs 3, 40% of the two")
+    assert (played["result"], played["weight"], played["evidence"]) == (True, -100, "made 2, missed 6")
     assert context.metadata["verifications"]["grade"]["score"] == pytest.approx(0.2)
+    missed = context.metadata["verifications"]["strict"]["results"][-1]
+    assert (missed["name"], missed["result"], missed["evidence"]) == ("missed", False, "missed 6 of 8 (75%)")
+    assert context.metadata["verifications"]["strict"]["score"] == 0.0

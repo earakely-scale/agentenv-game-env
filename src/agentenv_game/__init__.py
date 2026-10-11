@@ -14,6 +14,7 @@ from .env import (
     match_report,
     play_out,
     player_slot_card,
+    player_slot_headers,
     player_slot_limits,
     player_teams,
     spectator_card,
@@ -38,6 +39,7 @@ from .match import (
     MatchFiles,
     MatchReport,
     MatchStatus,
+    Moves,
     PlayerState,
     PlayerStatus,
     Score,
@@ -46,7 +48,8 @@ from .routing import SPECTATORS, PlayerPaths, current_player, current_spectator
 
 __all__ = ["LICENSE", "LOBBY", "MATCH", "SPECTATORS", "AgentEnvGameEnv", "Counter", "GameError", "LicenseItem",
            "LicenseKind", "LicenseParts", "Lobby", "LobbyStatus", "Match", "MatchFile", "MatchFiles", "MatchReport",
-           "MatchStatus", "PlayerKind", "PlayerPaths", "PlayerSlot", "PlayerSlotLimits", "PlayerState", "PlayerStatus",
-           "PlayerTeam", "Score", "SlotRequest", "begin_game", "check_player_slot", "create_game", "current_player",
-           "current_spectator", "install_license", "license_needs", "match_files", "match_report", "play_out",
-           "player_slot_card", "player_slot_limits", "player_teams", "spectator_card"]
+           "MatchStatus", "Moves", "PlayerKind", "PlayerPaths", "PlayerSlot", "PlayerSlotLimits", "PlayerState",
+           "PlayerStatus", "PlayerTeam", "Score", "SlotRequest", "begin_game", "check_player_slot", "create_game",
+           "current_player", "current_spectator", "install_license", "license_needs", "match_files", "match_report",
+           "play_out", "player_slot_card", "player_slot_headers", "player_slot_limits", "player_teams",
+           "spectator_card"]

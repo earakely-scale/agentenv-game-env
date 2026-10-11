@@ -69,10 +69,20 @@ class Score(_Model):
     unit: str | None = None
 
 
+class Moves(_Model):
+    """How much a player took part, in the game's own unit (an order, a turn): the moves it made, and those the game
+    went on without, in the same unit (a turn the game ended for it)."""
+
+    made: int = Field(0, ge=0)
+    missed: int = Field(0, ge=0)
+
+
 class PlayerState(_Model):
     status: PlayerStatus
     scores: list[Score] | None = None
     """The first is the game's main score."""
+    moves: Moves | None = None
+    """None for a game that doesn't count them."""
 
 
 class Match(_Model):
@@ -100,6 +110,8 @@ class MatchReport(_Model):
     """By player_id, those the rules have decided."""
     scores: dict[str, list[Score]] = {}
     """By player_id."""
+    moves: dict[str, Moves] = {}
+    """By player_id: how much each took part, for a game that counts it."""
 
 
 class MatchFile(_Model):

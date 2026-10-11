@@ -14,6 +14,7 @@ from agentenv_game import (
     GameError,
     MatchReport,
     MatchStatus,
+    Moves,
     PlayerKind,
     PlayerSlotLimits,
     PlayerStatus,
@@ -52,7 +53,7 @@ class Race(AgentEnvGameEnv):
     async def line_up(self, lobby):
         self.length, self.limit = lobby.game_settings["length"], lobby.game_settings["limit"]
         self.ai = [s.player_id for s in lobby.player_slots if s.player_kind is PlayerKind.AI]
-        self.at, self.ticks = {s.player_id: 0 for s in lobby.player_slots}, 0
+        self.at, self.ticks, self.made, self.missed = {s.player_id: 0 for s in lobby.player_slots}, 0, {}, {}
 
     @begin_game
     async def go(self):
@@ -62,6 +63,8 @@ class Race(AgentEnvGameEnv):
     async def run_out(self):
         while not self.winners() and self.ticks < self.limit:
             self.tick()
+            for player_id in set(self.at) - set(self.ai):
+                self.missed[player_id] = self.missed.get(player_id, 0) + 1
 
     @match_report
     def report(self):
@@ -73,18 +76,21 @@ class Race(AgentEnvGameEnv):
                                                          else "out of time" if over else None),
             progress=[Counter(name="race", unit="ticks", value=self.ticks, limit=self.limit)],
             outcomes={p: "won" if p in winners else "lost" for p in self.at} if winners else {},
-            scores={p: [Score(name="distance", value=d, better="higher")] for p, d in self.at.items()})
+            scores={p: [Score(name="distance", value=d, better="higher")] for p, d in self.at.items()},
+            moves={p: Moves(made=self.made.get(p, 0), missed=self.missed.get(p, 0)) for p in self.at})
 
     async def step(self, player_id):
         await self.player_ready(player_id)
         if self.match.status is MatchStatus.STARTED:
             self.at[player_id] += 1
+            self.made[player_id] = self.made.get(player_id, 0) + 1
 
     def tick(self):
         self.ticks += 1
         if self.ticks % 2 == 0:
             for player_id in self.ai:
                 self.at[player_id] += 1
+                self.made[player_id] = self.made.get(player_id, 0) + 1
 
     def winners(self):
         return sorted(p for p, d in self.at.items() if d >= self.length)
@@ -157,6 +163,7 @@ async def test_a_gated_game_starts_once_every_player_is_ready():
     assert match.status is MatchStatus.STARTED and set(statuses(match).values()) == {UNDECIDED} and game.begun == 1
     await game.step("a")
     assert game.match.player_states["a"].scores == [Score(name="distance", value=1, better="higher")]
+    assert game.match.player_states["a"].moves == Moves(made=1, missed=0)
     assert (await game.player_ready("a")).status is MatchStatus.STARTED and game.begun == 1
     assert "its player slots are a, b, c" in await refused("bad_player", game.player_ready, "z")
 

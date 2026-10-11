@@ -20,10 +20,11 @@ from .steps import _deployed, _invoke
 log = logging.getLogger(__name__)
 
 OUTCOME = "outcome"
+GATE_WEIGHT = -100
 POINTS = {PlayerStatus.WON: 1.0, PlayerStatus.DRAWN: 0.5, PlayerStatus.UNDECIDED: 0.5, PlayerStatus.LOST: 0.0}
 OUTCOMES = {PlayerStatus.WON: "won", PlayerStatus.DRAWN: "drawn: the game's own tie",
             PlayerStatus.UNDECIDED: "a draw: the match ended without deciding this player", PlayerStatus.LOST: "lost"}
-PARAMS = ("player_ids", "weights", "verifier_id", "timeout_seconds")
+PARAMS = ("player_ids", "weights", "max_missed", "verifier_id", "timeout_seconds")
 
 
 def share(mine: float, best: float, better: str) -> float:
@@ -68,6 +69,18 @@ def versus(name: str, states: dict, player: str, opponents: list[str]) -> dict:
                         + (" (lower is better)" if better == "lower" else "")}
 
 
+def gates(moves: dict, max_missed: float | None) -> list[dict]:
+    """A player that made no move, or missed more than `max_missed` of its moves, scores 0: the game's own count."""
+    made, missed = moves["made"], moves["missed"]
+    rows = [{"name": "played", "criterion": "the player made a move", "result": made > 0,
+             "evidence": f"made {made}, missed {missed}"}]
+    if max_missed is not None:
+        share = missed / (made + missed) if made + missed else 0.0
+        rows.append({"name": "missed", "criterion": f"missed at most {max_missed:.0%} of its moves",
+                     "result": share <= max_missed, "evidence": f"missed {missed} of {made + missed} ({share:.0%})"})
+    return [{**row, "weight": GATE_WEIGHT} for row in rows]
+
+
 def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -77,13 +90,16 @@ class GradeMatchTaskStep(TaskStep):
     them, on the outcome alone by default, a win 1, a draw 0.5, a loss 0, where a player the match ended without
     deciding (nobody won by its limit) draws. `weights` merges into {"outcome": 1}: a score the game reports counts as
     its share against the best opponent's, and a weight of 0 keeps a criterion for the record only, as every score is
-    kept. A match that didn't finish has no outcome, so the step fails rather than read it as a loss."""
+    kept. A game that counts its players' moves gates the grade on them: a player that made none scores 0, and so
+    does one that missed more than `max_missed` (a share) of its moves. A match that didn't finish has no outcome, so
+    the step fails rather than read it as a loss."""
 
     type: ClassVar[str] = "grade_match"
     entity_refs = (EntityRef.env("env_id"),)
 
     def __init__(self, id: str, version: int | None, env_id: str, player_ids: list | None = None,
-                 weights: dict | None = None, verifier_id: str | None = None, timeout_seconds: int = 60,
+                 weights: dict | None = None, max_missed: float | None = None, verifier_id: str | None = None,
+                 timeout_seconds: int = 60,
                  depends_on: list | None = None, fail_task_on_error: bool = True):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         if player_ids is not None and not (isinstance(player_ids, list) and player_ids
@@ -93,7 +109,9 @@ class GradeMatchTaskStep(TaskStep):
                                         and all(isinstance(k, str) and k and _number(w) for k, w in weights.items())):
             raise ValueError("grade_match weights maps each criterion, outcome or the name of a score the game "
                              "reports, to a number")
-        self.env_id, self.timeout_seconds = env_id, timeout_seconds
+        if max_missed is not None and not (_number(max_missed) and 0 <= max_missed <= 1):
+            raise ValueError("grade_match max_missed is a share of a player's moves, 0 to 1")
+        self.env_id, self.timeout_seconds, self.max_missed = env_id, timeout_seconds, max_missed
         self.player_ids = list(player_ids) if player_ids is not None else None
         self.weights, self.verifier_id = dict(weights or {}), verifier_id or id
         if not any(w > 0 for w in self.criteria().values()):
@@ -138,6 +156,11 @@ class GradeMatchTaskStep(TaskStep):
             opponents = [p for p in slots if team[p] != team[player]]
             rows = [self._row(OUTCOME, outcome(PlayerStatus(states[player]["status"]), match))]
             rows += [self._row(name, versus(name, states, player, opponents)) for name in reported]
+            if (moves := states[player].get("moves")) is not None:
+                rows += gates(moves, self.max_missed)
+            elif self.max_missed is not None:
+                raise RuntimeError(f"grade_match max_missed needs the game's count of moves, and it gives none for "
+                                   f"player slot {player!r}")
             out[self.verifier_id if alone else f"{self.verifier_id}:{player}"] = rows
         return out
 
