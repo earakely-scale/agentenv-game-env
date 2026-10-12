@@ -36,11 +36,25 @@ this package gives every game env one way to say who plays it and how it is goin
 The same task steps then put players in any game: one agent against the game's AI, two models against each other, a
 person beside an agent.
 
-**Two examples to read:**
-- **[Warcraft III](https://github.com/earakely-scale/agentenv-wc3-plugin)**, a real game built on this package. Its
-  lobby takes a match's settings (map, seed, time limit, stepping or realtime), and its player slots take a faction, a
-  team, a label and, for the game's AI, a level. Its tasks broadcast matches like the one above and keep each match's
-  native replay, videos and timeline as its match files.
+**Three examples to read:**
+- **[Warcraft III](https://github.com/earakely-scale/agentenv-wc3-plugin)**, a real-time strategy game built on this
+  package. Its lobby takes a match's settings (map, seed, time limit, stepping or realtime), and its player slots take a
+  faction, a team, a label and, for the game's AI, a level. Its match counts each agent's orders as its moves. Its
+  tasks broadcast matches like the one above and keep each match's native replay, videos and timeline as its match
+  files.
+- **[OpenCiv3](https://github.com/earakely-scale/agentenv-openciv-plugin)**, an open-source Civilization III remake: a
+  turn-based game of up to twelve civilizations, people among them. Its lobby takes the map, the turn limit and the
+  pace and broadcast of a match people watch. Each player slot takes a civilization, played by an agent, by a person
+  (whose play token is the slot's secret headers, so the play page is theirs alone) or by the game's AI. Its match
+  counts turns and decides each outcome by the game's own victories, and its moves are the turns each player ended
+  itself against those the env ended for it, which `grade_match` gates on. Its tasks keep each match's map video and
+  HTML replay as its match files, and its broadcast is its own, with two AI casters:
+
+  ![An OpenCiv3 match between three Claude Haiku 4.5 agents on OpenCiv3's own broadcast: the map, each civilization's card, the standings, the agents' plans, notes and messages, the casters' captions, and the game-over card](docs/media/openciv3-broadcast.gif)
+
+  *A 12-turn OpenCiv3 match between three Claude Haiku 4.5 agents, set up by this package's lobby steps and graded
+  by `grade_match` (Egypt won on score, 45 to 42), on OpenCiv3's own broadcast with its two AI casters (8× speed,
+  then the game-over card at normal speed).*
 - **[Tic-tac-toe](examples/tictactoe.py)**, about 170 lines in this repo: every part of the package in one small game.
   [Try it](#try-it-tic-tac-toe) walks through it.
 
